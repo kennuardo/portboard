@@ -110,9 +110,16 @@ class _Registry:
             key=lambda pair: len(pair[0] or ""), reverse=True,
         )
         self.by_unit: dict[str, dict] = {}
+        self.by_cid: dict[str, dict] = {}   # container id remembered from an earlier full reconcile
         for inst in self.instances:
             if inst["unit"]:
                 self.by_unit.setdefault(inst["unit"], inst)
+            try:
+                cid = json.loads(inst.get("extra_json") or "{}").get("container_id")
+            except (TypeError, ValueError):
+                cid = None
+            if cid:
+                self.by_cid.setdefault(cid, inst)
         self.by_project_label = {(i["project_id"], i["label"]): i for i in self.instances}
 
     def resolve(self, path: str | None):
@@ -130,6 +137,17 @@ class _Registry:
                     label = rel[len(_WORKTREE_PARTS)]
                     ipath = os.path.join(ppath, *_WORKTREE_PARTS, label)
                 return project, label, ipath
+        return None
+
+    def instance_by_cid(self, cid: str | None) -> dict | None:
+        if not cid:
+            return None
+        hit = self.by_cid.get(cid)
+        if hit is not None:
+            return hit
+        for key, inst in self.by_cid.items():
+            if key.startswith(cid) or cid.startswith(key):
+                return inst
         return None
 
     def instance_for(self, project: dict, label: str) -> dict | None:
@@ -171,6 +189,7 @@ def _describe(machine: _Machine, listener: sysinfo.Listener) -> dict:
         "compose_project": container.compose_project if container else None,
         "compose_workdir": container.compose_workdir if container else None,
         "_container": container,
+        "_cid": (container.id if container else None) or cid,
         "_in_container": bool(container or cid),
     }
 
@@ -181,6 +200,9 @@ def _match(reg: _Registry, seen: dict):
         inst = reg.by_unit.get(key) if key else None
         if inst is not None:
             return inst, reg.project_by_id.get(inst["project_id"]), inst["label"], inst["path"]
+    inst = reg.instance_by_cid(seen.get("_cid"))
+    if inst is not None:
+        return inst, reg.project_by_id.get(inst["project_id"]), inst["label"], inst["path"]
     # a process inside a container reports the container's cwd (/app), useless here
     candidates = [seen["compose_workdir"]] if seen["_in_container"] else [seen["cwd"]]
     for path in candidates:
@@ -335,6 +357,15 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
             }
             if stat:
                 fields["cpu_checked_at"] = ts
+            cid = meta.get("_cid")
+            if cid and len(cid) >= 12:
+                try:
+                    extra = json.loads(inst.get("extra_json") or "{}")
+                except (TypeError, ValueError):
+                    extra = {}
+                if extra.get("container_id") != cid:
+                    extra["container_id"] = cid
+                    fields["extra_json"] = json.dumps(extra)
             if inst["state"] != "running":
                 started.append(inst_id)
                 fields["stopped_at"] = None
@@ -349,6 +380,11 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
                 continue
             if inst["state"] != "running":
                 continue  # 'starting' belongs to the runner, stopped/failed stay
+            kind = (reg.project_by_id.get(inst["project_id"]) or {}).get("kind")
+            if not machine.docker and kind in ("compose", "none"):
+                # quick mode did not look at docker: a bridge-published or
+                # host-network container is simply invisible here, not gone
+                continue
             recent_stop = _parse_ts(inst["stopped_at"])
             fields = {"state": "stopped", "pid": None, "actual_port": None, "updated_at": ts}
             if inst["managed"] and not (recent_stop and recent_stop >= limit):

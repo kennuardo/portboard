@@ -272,3 +272,40 @@ class ReconcileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuickModeDockerBackedTests(unittest.TestCase):
+    """quick=True must never mark compose/none instances stopped: docker was not inspected."""
+
+    def test_quick_keeps_compose_instance_running(self):
+        import sqlite3, tempfile, os, json
+        from unittest import mock
+        from portboard import db, reconcile
+        tmp = tempfile.mkdtemp()
+        conn = db.connect()
+        ts = db.now()
+        conn.execute("DELETE FROM instances"); conn.execute("DELETE FROM projects")
+        conn.execute("INSERT INTO projects(name, path, kind, port_mode, base_port, created_at, updated_at)"
+                     " VALUES ('wh', ?, 'compose', 'fixed', 18765, ?, ?)", (tmp, ts, ts))
+        pid = conn.execute("SELECT id FROM projects WHERE name='wh'").fetchone()[0]
+        conn.execute("INSERT INTO instances(project_id, label, slot, path, port, managed, state, extra_json,"
+                     " created_at, updated_at) VALUES (?, 'main', 0, ?, 18765, 1, 'running',"
+                     " '{\"container_id\": \"abcdef123456abcdef123456\"}', ?, ?)", (pid, tmp, ts, ts))
+        iid = conn.execute("SELECT id FROM instances").fetchone()[0]
+        # quick mode, listener invisible (bridge-published, root-owned): must stay running
+        with mock.patch.object(reconcile.sysinfo, "listening_ports", return_value=[]), \
+             mock.patch.object(reconcile.sysinfo, "unit_cgroup_stats", return_value={}):
+            summary = reconcile.reconcile(conn, quick=True)
+        self.assertEqual(summary["stopped"], [])
+        self.assertEqual(conn.execute("SELECT state FROM instances WHERE id=?", (iid,)).fetchone()[0], "running")
+        # quick mode, host-network container visible through its pid cgroup: matched by remembered id
+        lst = reconcile.sysinfo.Listener(port=18765, proto="tcp", bind="0.0.0.0", pid=4242, comm="python")
+        info = reconcile.sysinfo.ProcInfo(pid=4242, cwd=None, cmdline="python server.py", comm="python",
+                                          unit=None, container="abcdef123456", uid=0, ppid=1)
+        with mock.patch.object(reconcile.sysinfo, "listening_ports", return_value=[lst]), \
+             mock.patch.object(reconcile.sysinfo, "proc_info", return_value=info), \
+             mock.patch.object(reconcile.sysinfo, "unit_cgroup_stats", return_value={}):
+            summary = reconcile.reconcile(conn, quick=True)
+        row = conn.execute("SELECT state, actual_port, pid FROM instances WHERE id=?", (iid,)).fetchone()
+        self.assertEqual(tuple(row), ("running", 18765, 4242))
+        conn.close()
