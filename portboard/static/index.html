@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Portboard</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6feb'/%3E%3Cpath fill-rule='evenodd' d='M10 25V7h7a5.5 5.5 0 0 1 0 11h-2.6v7zm4.4-14.4v3.8h2.5a1.9 1.9 0 0 0 0-3.8z' fill='%23ffffff'/%3E%3C/svg%3E">
 <style>
 /* ---------------------------------------------------------------- palette */
 :root {
@@ -758,8 +759,16 @@ td.acts { white-space: nowrap; }
     return h.join("");
   }
 
+  function isActiveProject(p) {
+    return (p.instances || []).some(function (i) { return i.state === "running" || i.state === "starting"; });
+  }
+
   function renderProjects(state) {
-    var projects = (state && state.projects) || [];
+    // active projects first (the API returns them by name), then alphabetical
+    var projects = ((state && state.projects) || []).slice().sort(function (a, b) {
+      var d = (isActiveProject(b) ? 1 : 0) - (isActiveProject(a) ? 1 : 0);
+      return d || String(a.name || "").localeCompare(String(b.name || ""));
+    });
     var cards = projects.map(projectCardHtml);
     var visible = cards.filter(function (c) { return c !== ""; }).length;
     q("#projects").innerHTML = cards.join("") || '<div class="empty">' +
@@ -777,8 +786,16 @@ td.acts { white-space: nowrap; }
     }).join("");
   }
 
+  function observedRank(o) {
+    if (o.instance_id) { return 0; }          // known instance: the active ones
+    if (o.project_id) { return 1; }           // in a project dir, but no instance
+    return 2;                                 // unknown listener
+  }
+
   function renderObserved(state) {
-    var rows = ((state && state.observed) || []).slice().sort(function (a, b) { return (a.port || 0) - (b.port || 0); });
+    var rows = ((state && state.observed) || []).slice().sort(function (a, b) {
+      return (observedRank(a) - observedRank(b)) || ((a.port || 0) - (b.port || 0));
+    });
     var instById = {};
     ((state && state.projects) || []).forEach(function (p) {
       (p.instances || []).forEach(function (i) { instById[i.id] = { project: p, inst: i }; });
