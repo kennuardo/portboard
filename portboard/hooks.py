@@ -208,7 +208,7 @@ def _format_session_start(project: dict, instance: dict, instances: list[dict], 
     else:
         checkout_desc = "main checkout"
 
-    lines = [f"[portboard] project {name}, checkout {checkout_desc}"]
+    lines = [f"[portboard] project {name}, {checkout_desc}"]
     if port:
         lines.append(f"assigned port {port}, test URL {url}")
     else:
@@ -220,8 +220,8 @@ def _format_session_start(project: dict, instance: dict, instances: list[dict], 
         inst_port = inst.get("port")
         state = inst.get("state", "unknown")
         if state == "running":
-            unit = inst.get("unit")
-            since = inst.get("started_at") or "?"
+            unit = inst.get("unit") or (project.get("start_cmd") if project.get("kind") == "unit" else None) or "-"
+            since = (inst.get("started_at") or "?")[11:16] if inst.get("started_at") else "?"
             owner = inst.get("owner_session") or "none"
             detail = f"running: {bit_label}@{inst_port} (unit {unit}, since {since}, owner {owner})"
         else:
@@ -250,6 +250,14 @@ def session_end(conn, payload: dict) -> None:
         log.exception("session_end: release_owner failed for session %s", session_id)
 
 
+def _strip_port(command: str) -> str:
+    """Remove an explicit port from a dev-server command so a corrected one can be suggested."""
+    out = re.sub(r"(?:^|\s)PORT=\d+\s*", " ", command)
+    out = re.sub(r"\s(?:--port(?:=|\s+)|-p\s+)\d+", "", out)
+    out = re.sub(r"\s--\s*$", "", out)
+    return out.strip()
+
+
 def pre_tool_use(conn, payload: dict) -> dict | None:
     tool_input = payload.get("tool_input") or {}
     command = tool_input.get("command") or ""
@@ -260,6 +268,7 @@ def pre_tool_use(conn, payload: dict) -> dict | None:
     cwd = payload.get("cwd")
     if not cwd:
         return None
+    log.info("pre_tool_use: %s detected in %s (%s)", detected.get("kind"), cwd, command[:120])
 
     from . import registry
 
@@ -282,7 +291,12 @@ def pre_tool_use(conn, payload: dict) -> dict | None:
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": f"{reason}. Use MCP instance_start or run: PORT=<n> {command.split()[0] if command else 'cmd'}",
+                "permissionDecisionReason": (
+                    f"{reason}. Start it through portboard instead: MCP tool instance_start(cwd=\"{cwd}\") "
+                    f"or `portboard start --cwd {cwd}`"
+                    + (f", or run it yourself on the assigned port: PORT={assigned_port} {_strip_port(command)}"
+                       if assigned_port else "")
+                ),
             }
         }
 

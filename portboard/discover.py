@@ -304,6 +304,16 @@ def _base(root: str) -> dict[str, Any]:
     }
 
 
+MANIFEST_FILES = (
+    "package.json", "pyproject.toml", "requirements.txt", "setup.py", "setup.cfg",
+    "go.mod", "Cargo.toml", "composer.json", "Gemfile", "mix.exs", "Procfile",
+)
+
+
+def _has_manifest(root: str) -> bool:
+    return any(os.path.isfile(os.path.join(root, name)) for name in MANIFEST_FILES)
+
+
 def suggest(path: str) -> dict | None:
     """Suggested project configuration for a repository directory, or None."""
     root = os.path.realpath(os.path.expanduser(str(path)))
@@ -382,7 +392,24 @@ def suggest(path: str) -> dict | None:
                         target = wanted
                         break
             if target is None:
-                return None
+                if not _has_manifest(root):
+                    return None
+                # A repository with a manifest but no recognizable start command
+                # is still a project: register it without a start command so it
+                # gets a port and shows up in the GUI; the user fills the rest in.
+                result["kind"] = "none"
+                result["port_mode"] = "env"
+                result["start_cmd"] = None
+                evidence.append("no recognizable start command; set one with: portboard project edit <name> --start '...'")
+                candidates = _candidates(root, include_compose=False)
+                port_choice = candidates[0] if candidates else None
+                if port_choice:
+                    result["base_port"] = port_choice[0]
+                    evidence.append(port_choice[2])
+                result["confidence"] = "low"
+                if not has_git(root):
+                    evidence.append("no .git (not a git repository)")
+                return result
             result["kind"] = "transient"
             result["port_mode"] = "env"
             result["start_cmd"] = f"make {target}"
