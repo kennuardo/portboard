@@ -285,10 +285,18 @@ Claude Code. Keep SessionStart under 300 ms: direct DB access, `reconcile(quick=
   `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
   "permissionDecisionReason": "<why>. Use MCP instance_start or run: PORT=<n> <cmd>"}}`.
   Otherwise exit 0 silently.
-* `worktree-create` / `worktree-remove`: accept `cwd`, `worktree_path`, `path`
-  and `branch` keys (whichever exist; log the raw JSON at DEBUG level so the
-  real field names can be confirmed). Create/remove the instance for that path
-  (stop it first on remove).
+* `cwd-changed` (event `CwdChanged`, fires on `cd` and on entering a worktree;
+  no matcher, notification only): read `cwd` (also accept `new_cwd` if present;
+  log the payload keys at INFO once). If cwd resolves to a known project and is
+  a worktree path without an instance row, create the row (slot + port) so the
+  GUI shows it before anything runs. Print nothing.
+* `worktree-remove` (event `WorktreeRemove`, informational, fields
+  `session_id`, `cwd`, `worktree_path`): stop and delete the instance whose
+  path equals `worktree_path`; also `docker compose stop` is covered by the
+  runner for compose instances. Print nothing.
+* NOT used: `WorktreeCreate`. Per the docs it "replaces default git behavior":
+  a registered hook must create the worktree itself and print its path, and any
+  non-zero exit aborts creation. Portboard must never own worktree creation.
 
 ## Install (install.py)
 

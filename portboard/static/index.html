@@ -1,0 +1,1205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Portboard</title>
+<style>
+/* ---------------------------------------------------------------- palette */
+:root {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --panel-2: #fafbfc;
+  --sunken: #eef0f3;
+  --border: #d9dde3;
+  --border-strong: #bcc3cc;
+  --text: #1b1f24;
+  --muted: #5f6b7a;
+  --faint: #8b96a5;
+  --accent: #2f6feb;
+  --accent-soft: #e3ecfd;
+  --green: #1a7f3c;
+  --green-soft: #e2f4e8;
+  --amber: #9a6400;
+  --amber-soft: #fdf1d8;
+  --red: #b3261e;
+  --red-soft: #fce8e6;
+  --grey: #5f6b7a;
+  --grey-soft: #e8ebef;
+  --shadow: 0 1px 2px rgba(16, 22, 30, .06), 0 4px 12px rgba(16, 22, 30, .06);
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b;
+    --panel: #1c2025;
+    --panel-2: #21262c;
+    --sunken: #171a1e;
+    --border: #30363d;
+    --border-strong: #454d57;
+    --text: #e4e8ee;
+    --muted: #9aa5b1;
+    --faint: #78828e;
+    --accent: #5b91f5;
+    --accent-soft: #1b2b47;
+    --green: #4fc27a;
+    --green-soft: #16301f;
+    --amber: #e0a13a;
+    --amber-soft: #33270f;
+    --red: #f2837b;
+    --red-soft: #3a1b19;
+    --grey: #9aa5b1;
+    --grey-soft: #262c33;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
+  }
+}
+
+/* ------------------------------------------------------------------ base */
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  overflow-x: hidden;
+}
+h1, h2, h3 { margin: 0; font-weight: 600; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+.mono { font-family: var(--mono); }
+.wrap { max-width: 1400px; margin: 0 auto; padding: 0 16px 48px; }
+
+/* ---------------------------------------------------------------- header */
+.top {
+  position: sticky; top: 0; z-index: 30;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.top-in {
+  max-width: 1400px; margin: 0 auto; padding: 8px 16px;
+  display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+}
+.brand { font-size: 15px; font-weight: 700; letter-spacing: .2px; }
+.brand span { font-weight: 400; color: var(--faint); font-size: 11px; margin-left: 4px; }
+.top .spacer { flex: 1 1 auto; }
+.top nav { display: flex; flex-wrap: wrap; gap: 6px; }
+.meta { color: var(--muted); font-size: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.meta b { color: var(--text); font-weight: 600; }
+
+/* --------------------------------------------------------------- buttons */
+button, .btn {
+  font: inherit; font-size: 12px; line-height: 1;
+  padding: 5px 9px; border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-2); color: var(--text);
+  cursor: pointer; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 5px;
+  text-decoration: none;
+}
+button:hover:not(:disabled), .btn:hover:not(.off) { background: var(--sunken); border-color: var(--accent); }
+button:disabled, .btn.off { opacity: .45; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+button.danger { color: var(--red); border-color: var(--border-strong); }
+button.danger:hover:not(:disabled) { border-color: var(--red); background: var(--red-soft); }
+button.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+button.ghost:hover:not(:disabled) { background: var(--sunken); border-color: var(--border); }
+button.tiny, .btn.tiny { padding: 3px 6px; font-size: 11px; }
+button.busy::before {
+  content: ""; width: 10px; height: 10px; border-radius: 50%;
+  border: 2px solid currentColor; border-top-color: transparent;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { button.busy::before { animation-duration: 2s; } }
+
+/* ----------------------------------------------------------------- pills */
+.pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pill.running { color: var(--green); background: var(--green-soft); border-color: var(--green); }
+.pill.starting { color: var(--amber); background: var(--amber-soft); border-color: var(--amber); }
+.pill.failed { color: var(--red); background: var(--red-soft); border-color: var(--red); }
+.pill.stopped, .pill.unknown { color: var(--grey); background: var(--grey-soft); border-color: var(--border-strong); }
+.badge {
+  display: inline-block; padding: 1px 6px; border-radius: 4px;
+  font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .3px;
+  background: var(--grey-soft); color: var(--muted); border: 1px solid var(--border);
+}
+.badge.accent { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.badge.amber { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
+
+/* -------------------------------------------------------------- sections */
+section { margin-top: 18px; }
+.sec-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 4px 0 8px;
+}
+.sec-head h2 { font-size: 14px; letter-spacing: .2px; }
+.sec-head h2 button { font-size: 14px; font-weight: 600; padding: 3px 6px; }
+.sec-head .count { color: var(--faint); font-size: 12px; font-weight: 400; }
+.sec-head .spacer { flex: 1 1 auto; }
+.caret { transition: transform .12s ease; display: inline-block; }
+[data-collapsed="1"] .caret { transform: rotate(-90deg); }
+[data-collapsed="1"] .sec-body { display: none; }
+input[type=text], input[type=search], input[type=number], input[type=time], select, textarea {
+  font: inherit; font-size: 12px; padding: 5px 7px;
+  border: 1px solid var(--border-strong); border-radius: 5px;
+  background: var(--panel); color: var(--text); min-width: 0;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+#filter { width: 260px; max-width: 46vw; }
+
+/* ----------------------------------------------------------------- cards */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+.card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.card > header {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  padding: 8px 10px; background: var(--panel-2); border-bottom: 1px solid var(--border);
+}
+.card > header h3 { font-size: 13.5px; }
+.card > header .spacer { flex: 1 1 auto; }
+.card .path {
+  font-family: var(--mono); font-size: 11px; color: var(--faint);
+  padding: 5px 10px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left;
+}
+.card .notes { padding: 3px 10px 0; font-size: 11.5px; color: var(--muted); }
+.card .card-foot {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  padding: 8px 10px; border-top: 1px solid var(--border); background: var(--panel-2);
+}
+.card .card-foot .spacer { flex: 1 1 auto; }
+.insts { padding: 6px 0 2px; }
+.inst { padding: 7px 10px; border-top: 1px dashed var(--border); }
+.inst:first-child { border-top: 0; }
+.inst-l1 { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.inst-l1 .label { font-weight: 600; }
+.inst-l2 { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+.inst-l2 span { white-space: nowrap; }
+.inst-l3 { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+.port { font-family: var(--mono); font-weight: 600; }
+.drift { color: var(--amber); font-family: var(--mono); font-weight: 600; }
+.owner { font-family: var(--mono); }
+pre.logs {
+  margin: 7px 0 0; padding: 8px; border-radius: 6px;
+  background: var(--sunken); border: 1px solid var(--border);
+  font-family: var(--mono); font-size: 11px; line-height: 1.4;
+  max-height: 300px; overflow: auto; white-space: pre;
+}
+form.inline {
+  display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+  padding: 8px 10px; background: var(--sunken); border-top: 1px solid var(--border);
+}
+form.inline label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); }
+form.inline label input, form.inline label select { width: 100%; }
+form.inline .full { flex: 1 1 100%; }
+form.inline .row { display: flex; gap: 6px; flex: 1 1 100%; flex-wrap: wrap; }
+form.inline .row > label { flex: 1 1 120px; }
+.check { flex-direction: row !important; align-items: center; gap: 5px !important; }
+
+/* ---------------------------------------------------------------- tables */
+.tablewrap {
+  overflow-x: auto; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow);
+}
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { text-align: left; padding: 5px 9px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--faint); background: var(--panel-2); position: sticky; top: 0; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: var(--panel-2); }
+tr.warn td { background: var(--amber-soft); }
+tr.warn:hover td { filter: brightness(.98); }
+td.num, th.num { font-family: var(--mono); }
+td.acts { white-space: nowrap; }
+.sub { color: var(--faint); font-size: 11px; }
+.empty { padding: 18px 10px; color: var(--faint); text-align: center; }
+
+/* --------------------------------------------------------------- overlay */
+.backdrop {
+  position: fixed; inset: 0; background: rgba(10, 14, 20, .45);
+  z-index: 40; display: none;
+}
+.backdrop.open { display: block; }
+.modal {
+  position: fixed; z-index: 50; top: 8vh; left: 50%; transform: translateX(-50%);
+  width: min(620px, calc(100vw - 24px)); max-height: 84vh; overflow: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .35); display: none;
+}
+.modal.open { display: block; }
+.drawer {
+  position: fixed; z-index: 50; top: 0; right: 0; height: 100%;
+  width: min(420px, 100vw);
+  display: flex; flex-direction: column;
+  background: var(--panel); border-left: 1px solid var(--border);
+  box-shadow: -8px 0 30px rgba(0, 0, 0, .25);
+  transform: translateX(102%); transition: transform .16s ease;
+}
+.drawer.open { transform: none; }
+@media (prefers-reduced-motion: reduce) { .drawer { transition: none; } }
+.modal header, .drawer header {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  border-bottom: 1px solid var(--border); background: var(--panel-2);
+  position: sticky; top: 0;
+}
+.modal header h2, .drawer header h2 { font-size: 14px; flex: 1 1 auto; }
+.pad { padding: 12px 14px; }
+.drawer .pad { flex: 1 1 auto; overflow: auto; }
+.field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 9px; }
+.field > span { font-size: 11px; color: var(--muted); }
+.field .hint { color: var(--faint); font-size: 10.5px; }
+.fields2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.note {
+  background: var(--amber-soft); border: 1px solid var(--amber); color: var(--amber);
+  border-radius: 6px; padding: 7px 9px; font-size: 11.5px; margin-bottom: 10px;
+}
+.foot { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--panel-2); position: sticky; bottom: 0; }
+.foot .spacer { flex: 1 1 auto; }
+
+/* ---------------------------------------------------------------- toasts */
+#toasts { position: fixed; z-index: 60; left: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 7px; max-width: min(440px, 90vw); }
+.toast {
+  padding: 8px 11px; border-radius: 7px; font-size: 12px;
+  background: var(--panel); border: 1px solid var(--border-strong); box-shadow: var(--shadow);
+  display: flex; gap: 8px; align-items: flex-start;
+}
+.toast.ok { border-color: var(--green); color: var(--green); }
+.toast.err { border-color: var(--red); color: var(--red); }
+.toast .msg { color: var(--text); word-break: break-word; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-in">
+    <div class="brand">Portboard<span id="version"></span></div>
+    <div class="meta">
+      <span id="daemon-pill" class="pill unknown"><i class="dot"></i>daemon ?</span>
+      <span id="daemon-info" class="sub"></span>
+      <span id="reconciled">reconciled <b>never</b></span>
+    </div>
+    <div class="spacer"></div>
+    <nav>
+      <button data-action="reconcile" class="primary" title="POST /api/reconcile with docker inspection">Reconcile</button>
+      <button data-action="schedule-stop" class="danger" title="POST /api/schedule/stop">Stop all now</button>
+      <button data-action="schedule-start" title="POST /api/schedule/start">Start morning set</button>
+      <button data-action="open-register">Register project</button>
+      <button data-action="open-settings">Settings</button>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section id="sec-projects" data-section="projects">
+    <div class="sec-head">
+      <h2><button class="ghost" data-action="collapse" data-target="projects" aria-expanded="true">
+        <span class="caret">&#9662;</span> Projects
+      </button></h2>
+      <span class="count" id="projects-count"></span>
+      <div class="spacer"></div>
+      <input type="search" id="filter" placeholder="filter: name, label, port, branch" aria-label="Filter projects">
+    </div>
+    <div class="sec-body"><div class="grid" id="projects"></div></div>
+  </section>
+
+  <section id="sec-ports" data-section="ports">
+    <div class="sec-head">
+      <h2><button class="ghost" data-action="collapse" data-target="ports" aria-expanded="true">
+        <span class="caret">&#9662;</span> Ports
+      </button></h2>
+      <span class="count" id="ports-count"></span>
+    </div>
+    <div class="sec-body">
+      <div class="tablewrap"><table id="observed"></table></div>
+      <section id="sec-reserved" data-section="reserved" style="margin-top:10px">
+        <div class="sec-head">
+          <h2><button class="ghost" data-action="collapse" data-target="reserved" aria-expanded="false">
+            <span class="caret">&#9662;</span> Reserved ports
+          </button></h2>
+          <span class="count" id="reserved-count"></span>
+        </div>
+        <div class="sec-body"><div class="tablewrap"><table id="reserved"></table></div></div>
+      </section>
+    </div>
+  </section>
+
+  <section id="sec-events" data-section="events">
+    <div class="sec-head">
+      <h2><button class="ghost" data-action="collapse" data-target="events" aria-expanded="true">
+        <span class="caret">&#9662;</span> Events
+      </button></h2>
+      <span class="count" id="events-count"></span>
+    </div>
+    <div class="sec-body"><div class="tablewrap"><table id="events"></table></div></div>
+  </section>
+
+</div>
+
+<div class="backdrop" id="backdrop" data-action="close-overlays"></div>
+
+<div class="modal" id="register" role="dialog" aria-modal="true" aria-labelledby="register-title">
+  <header><h2 id="register-title">Register project</h2><button class="ghost" data-action="close-overlays" aria-label="Close">&#10005;</button></header>
+  <form id="register-form" class="pad" data-form="register">
+    <div class="field">
+      <span>Path (absolute, required)</span>
+      <input type="text" name="path" class="mono" required placeholder="/mnt/hyper/Projects/my-app" autocomplete="off">
+      <span class="hint">The main checkout. Suggest reads it with GET /api/discover.</span>
+    </div>
+    <div class="fields2">
+      <label class="field"><span>Name</span><input type="text" name="name" placeholder="derived from the directory"></label>
+      <label class="field"><span>Kind</span>
+        <select name="kind">
+          <option value="transient">transient (systemd-run)</option>
+          <option value="unit">unit (existing --user unit)</option>
+          <option value="compose">compose (docker compose)</option>
+          <option value="none">none (observe only)</option>
+        </select>
+      </label>
+    </div>
+    <label class="field"><span>Start command</span><input type="text" name="start_cmd" class="mono" placeholder="npm run dev  |  sheron-dev.service"></label>
+    <div class="fields2">
+      <label class="field"><span>Port mode</span>
+        <select name="port_mode">
+          <option value="env">env (PORT / NUXT_PORT / NITRO_PORT)</option>
+          <option value="arg">arg ({port} in the command)</option>
+          <option value="fixed">fixed (unit or compose decides)</option>
+          <option value="none">none (no port)</option>
+        </select>
+      </label>
+      <label class="field"><span>Base port</span><input type="number" name="base_port" min="1024" max="32767" placeholder="allocator picks one"></label>
+    </div>
+    <label class="field check"><input type="checkbox" name="pinned" value="1"> <span>Pinned (schedule and idle rule never stop it)</span></label>
+    <div id="suggestion" class="sub"></div>
+  </form>
+  <div class="foot">
+    <button data-action="suggest">Suggest from path</button>
+    <div class="spacer"></div>
+    <button data-action="close-overlays">Cancel</button>
+    <button class="primary" data-action="submit-register">Register</button>
+  </div>
+</div>
+
+<aside class="drawer" id="settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <header><h2 id="settings-title">Settings</h2><button class="ghost" data-action="close-overlays" aria-label="Close">&#10005;</button></header>
+  <form id="settings-form" class="pad" data-form="settings">
+    <div class="note">Changing the schedule times, days or the daemon port needs <span class="mono">portboard install</span> afterwards to rewrite the systemd units and timers.</div>
+    <div class="fields2">
+      <label class="field"><span>Evening stop</span><input type="time" name="evening_stop"></label>
+      <label class="field"><span>Morning start</span><input type="time" name="morning_start"></label>
+    </div>
+    <label class="field"><span>Morning days (OnCalendar)</span><input type="text" name="morning_days" class="mono" placeholder="Mon..Fri"></label>
+    <label class="field"><span>Idle minutes (0 disables the idle stop)</span><input type="number" name="idle_minutes" min="0" max="1440"></label>
+    <div class="fields2">
+      <label class="field"><span>Pool start</span><input type="number" name="pool_start" min="1024" max="32767"></label>
+      <label class="field"><span>Pool end</span><input type="number" name="pool_end" min="1024" max="32767"></label>
+    </div>
+    <label class="field"><span>MemoryMax for transient units</span><input type="text" name="memory_max" class="mono" placeholder="4G"></label>
+    <label class="field check"><input type="checkbox" name="notify_on_schedule" value="1"> <span>Notify on schedule actions (notify-hermes)</span></label>
+    <div id="settings-other" class="sub"></div>
+  </form>
+  <div class="foot">
+    <button data-action="close-overlays">Cancel</button>
+    <div class="spacer"></div>
+    <button class="primary" data-action="submit-settings">Save changes</button>
+  </div>
+</aside>
+
+<div id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------- helpers */
+
+  var ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  // Every dynamic string goes through esc(): labels, paths and comms come
+  // from disk / other processes and are untrusted.
+  function esc(v) {
+    if (v === null || v === undefined) { return ""; }
+    return String(v).replace(/[&<>"']/g, function (c) { return ESCAPES[c]; });
+  }
+  function attr(v) { return esc(v); }
+  function q(sel, root) { return (root || document).querySelector(sel); }
+
+  function store(key, value) {
+    try {
+      if (value === undefined) { return window.localStorage.getItem("pb." + key); }
+      window.localStorage.setItem("pb." + key, value);
+    } catch (e) { /* private mode, blocked storage: the page works without it */ }
+    return null;
+  }
+
+  function fmtBytes(n) {
+    if (n === null || n === undefined || n === "") { return "–"; }
+    n = Number(n);
+    if (!isFinite(n) || n <= 0) { return "–"; }
+    var units = ["B", "KB", "MB", "GB", "TB"], i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return (i === 0 || n >= 100 ? Math.round(n) : n.toFixed(1)) + " " + units[i];
+  }
+
+  function fmtCpu(ns) {
+    if (ns === null || ns === undefined || ns === "") { return "–"; }
+    var s = Number(ns) / 1e9;
+    if (!isFinite(s)) { return "–"; }
+    return s.toFixed(1) + " s";
+  }
+
+  function parseTs(ts) {
+    if (!ts) { return null; }
+    var d = new Date(ts);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  function fmtTs(ts) {
+    var d = parseTs(ts);
+    if (!d) { return ts ? String(ts) : "–"; }
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    var hm = p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+    var today = new Date();
+    var fresh = Math.abs(Date.now() - d.getTime()) < 12 * 3600 * 1000;
+    if (fresh && d.toDateString() === today.toDateString()) { return hm; }
+    return p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + hm.slice(0, 5);
+  }
+
+  function fmtAgo(ts) {
+    var d = parseTs(ts);
+    if (!d) { return "never"; }
+    var s = Math.round((Date.now() - d.getTime()) / 1000);
+    if (s < 0) { return "in the future"; }
+    if (s < 45) { return s + " s ago"; }
+    if (s < 3600) { return Math.round(s / 60) + " min ago"; }
+    if (s < 86400) { return Math.round(s / 3600) + " h ago"; }
+    return Math.round(s / 86400) + " d ago";
+  }
+
+  function shortUnit(u) {
+    if (!u) { return ""; }
+    return String(u).replace(/\.service$/, "");
+  }
+
+  function shortSession(s) {
+    return s ? String(s).slice(0, 8) : "";
+  }
+
+  // Event detail may be a JSON string; show compact key=value pairs.
+  function fmtDetail(detail) {
+    if (detail === null || detail === undefined || detail === "") { return ""; }
+    var obj = null;
+    if (typeof detail === "object") {
+      obj = detail;
+    } else {
+      var t = String(detail).trim();
+      if (t.charAt(0) === "{" || t.charAt(0) === "[") {
+        try { obj = JSON.parse(t); } catch (e) { obj = null; }
+      }
+      if (obj === null) { return String(detail); }
+    }
+    if (Array.isArray(obj)) {
+      return obj.map(function (v) { return typeof v === "object" ? JSON.stringify(v) : String(v); }).join(", ");
+    }
+    if (typeof obj !== "object") { return String(obj); }
+    return Object.keys(obj).map(function (k) {
+      var v = obj[k];
+      if (v === null) { v = "null"; }
+      else if (typeof v === "object") { v = JSON.stringify(v); }
+      return k + "=" + v;
+    }).join("  ");
+  }
+
+  /* ---------------------------------------------------------------- toasts */
+
+  function toast(message, kind) {
+    var box = q("#toasts");
+    var el = document.createElement("div");
+    el.className = "toast " + (kind || "ok");
+    el.innerHTML = '<span>' + (kind === "err" ? "⚠" : "✓") + '</span><span class="msg">' + esc(message) + "</span>";
+    box.appendChild(el);
+    // one-shot auto-hide (not polling: no repeating timer anywhere in this file)
+    window.setTimeout(function () { if (el.parentNode) { el.parentNode.removeChild(el); } }, kind === "err" ? 8000 : 4000);
+  }
+
+  /* ------------------------------------------------------------------ api */
+
+  var api = {
+    request: function (method, path, body) {
+      var opts = { method: method, headers: { "Accept": "application/json" } };
+      if (body !== undefined && body !== null) {
+        opts.headers["Content-Type"] = "application/json";
+        opts.body = JSON.stringify(body);
+      }
+      return fetch(path, opts).then(function (res) {
+        return res.text().then(function (text) {
+          var data = null;
+          if (text) { try { data = JSON.parse(text); } catch (e) { data = { error: text.slice(0, 300) }; } }
+          if (!res.ok) {
+            throw new Error((data && data.error) || (res.status + " " + res.statusText));
+          }
+          return data;
+        });
+      });
+    },
+    get: function (path) { return this.request("GET", path); },
+    post: function (path, body) { return this.request("POST", path, body === undefined ? {} : body); },
+    patch: function (path, body) { return this.request("PATCH", path, body || {}); },
+    del: function (path) { return this.request("DELETE", path); }
+  };
+
+  /* ---------------------------------------------------------------- state */
+
+  var STATE = null;            // last /api/state payload
+  var EVENTS = [];             // last /api/events payload
+  var lastFetch = 0;           // ms epoch of the last successful fetch
+  var inFlight = false;
+  var openLogs = {};           // instance id -> log text, present = panel open
+  var openEdit = {};           // project id -> true while the edit form is open
+  var filterText = store("filter") || "";
+  var collapsed = {};
+  try { collapsed = JSON.parse(store("collapsed") || "{}") || {}; } catch (e) { collapsed = {}; }
+  if (collapsed.reserved === undefined) { collapsed.reserved = true; }
+
+  function saveCollapsed() { store("collapsed", JSON.stringify(collapsed)); }
+
+  function refresh() {
+    if (inFlight) { return Promise.resolve(); }
+    inFlight = true;
+    return Promise.all([
+      api.get("/api/state"),
+      api.get("/api/events?limit=50").catch(function () { return []; })
+    ]).then(function (both) {
+      STATE = both[0];
+      EVENTS = Array.isArray(both[1]) ? both[1] : [];
+      lastFetch = Date.now();
+      render(STATE, EVENTS);
+    }).catch(function (err) {
+      toast("Could not load state: " + err.message, "err");
+    }).then(function () { inFlight = false; });
+  }
+
+  /* --------------------------------------------------------------- render */
+
+  function statePill(state) {
+    var s = state || "unknown";
+    var known = { stopped: 1, starting: 1, running: 1, failed: 1, unknown: 1 };
+    if (!known[s]) { s = "unknown"; }
+    return '<span class="pill ' + s + '"><i class="dot"></i>' + esc(state || "unknown") + "</span>";
+  }
+
+  function renderHeader(state) {
+    var d = (state && state.daemon) || {};
+    var pill = q("#daemon-pill");
+    var alive = d.pid !== undefined && d.pid !== null;
+    pill.className = "pill " + (alive ? "running" : "unknown");
+    pill.innerHTML = '<i class="dot"></i>daemon ' + (alive ? "pid " + esc(d.pid) : "unknown");
+    var bits = [];
+    if (d.socket_activated !== undefined) { bits.push(d.socket_activated ? "socket-activated" : "standalone"); }
+    if (d.port) { bits.push("port " + d.port); }
+    if (d.idle_exit_seconds) { bits.push("idle exit " + Math.round(d.idle_exit_seconds / 60) + " min"); }
+    q("#daemon-info").textContent = bits.join(" · ");
+    q("#version").textContent = d.version ? "v" + d.version : "";
+    var rec = state && state.reconciled_at;
+    q("#reconciled").innerHTML = "reconciled <b title=\"" + attr(rec || "") + '">' + esc(fmtAgo(rec)) + "</b>";
+  }
+
+  function matchesFilter(project, inst) {
+    if (!filterText) { return true; }
+    var f = filterText.toLowerCase();
+    var hay = [];
+    if (inst) {
+      hay = [inst.label, inst.branch, inst.port, inst.actual_port, inst.path, project.name];
+    } else {
+      hay = [project.name, project.path, project.base_port, project.kind, project.notes];
+    }
+    for (var i = 0; i < hay.length; i++) {
+      if (hay[i] !== null && hay[i] !== undefined && String(hay[i]).toLowerCase().indexOf(f) !== -1) { return true; }
+    }
+    return false;
+  }
+
+  function instanceHtml(project, inst) {
+    var running = inst.state === "running";
+    var starting = inst.state === "starting";
+    var canStart = !running && !starting && project.kind !== "none";
+    var canStop = inst.state !== "stopped";
+    var drift = inst.actual_port && inst.port && inst.actual_port !== inst.port;
+    var url = inst.url || null;
+    var h = [];
+
+    h.push('<div class="inst" data-instance="' + attr(inst.id) + '">');
+    h.push('<div class="inst-l1">');
+    h.push('<span class="label">' + esc(inst.label) + "</span>");
+    if (inst.worktree || inst.slot > 0) { h.push('<span class="badge">worktree</span>'); }
+    if (!inst.managed) { h.push('<span class="badge amber" title="detected, not started by portboard">unmanaged</span>'); }
+    if (inst.branch) { h.push('<span class="sub mono">' + esc(inst.branch) + "</span>"); }
+    h.push('<span class="spacer" style="flex:1 1 auto"></span>');
+    if (inst.port) { h.push('<span class="port">:' + esc(inst.port) + "</span>"); }
+    if (drift) { h.push('<span class="drift" title="reconcile saw a different port">actual ' + esc(inst.actual_port) + "</span>"); }
+    h.push(statePill(inst.state));
+    h.push("</div>");
+
+    h.push('<div class="inst-l2">');
+    h.push("<span>RAM " + esc(fmtBytes(inst.mem_bytes)) + "</span>");
+    h.push("<span>CPU " + esc(fmtCpu(inst.cpu_ns)) + "</span>");
+    if (inst.pid) { h.push('<span class="mono">pid ' + esc(inst.pid) + "</span>"); }
+    if (inst.owner_session) {
+      h.push('<span>owner <span class="owner" title="' + attr(inst.owner_session) + '">' + esc(shortSession(inst.owner_session)) +
+        '</span> <button class="tiny ghost" data-action="release" data-id="' + attr(inst.id) + '" title="POST /api/instances/' + attr(inst.id) + '/release">release</button></span>');
+    }
+    if (running && inst.started_at) {
+      h.push('<span title="' + attr(inst.started_at) + '">up since ' + esc(fmtTs(inst.started_at)) + "</span>");
+    } else if (inst.stopped_at) {
+      h.push('<span title="' + attr(inst.stopped_at) + '">stopped ' + esc(fmtTs(inst.stopped_at)) +
+        (inst.stopped_by ? " (" + esc(inst.stopped_by) + ")" : "") + "</span>");
+    }
+    if (inst.idle_since) { h.push('<span class="badge amber" title="' + attr(inst.idle_since) + '">idle since ' + esc(fmtTs(inst.idle_since)) + "</span>"); }
+    if (inst.unit) { h.push('<span class="mono sub" title="' + attr(inst.unit) + '">' + esc(shortUnit(inst.unit)) + "</span>"); }
+    h.push("</div>");
+
+    h.push('<div class="inst-l3">');
+    h.push('<button data-action="start" data-id="' + attr(inst.id) + '"' + (canStart ? "" : " disabled") +
+      (project.kind === "none" ? ' title="kind none: portboard only observes this one"' : "") + ">Start</button>");
+    h.push('<button data-action="stop" data-id="' + attr(inst.id) + '"' + (canStop ? "" : " disabled") + ">Stop</button>");
+    h.push('<button data-action="restart" data-id="' + attr(inst.id) + '"' + (project.kind === "none" ? " disabled" : "") + ">Restart</button>");
+    if (url && running) {
+      h.push('<a class="btn" href="' + attr(url) + '" target="_blank" rel="noopener">Open</a>');
+    } else {
+      h.push('<a class="btn off" aria-disabled="true" tabindex="-1" title="' + (url ? "not running" : "no url for this instance") + '">Open</a>');
+    }
+    h.push('<button data-action="copy" data-url="' + attr(url || "") + '"' + (url ? "" : " disabled") + ">Copy link</button>");
+    h.push('<button data-action="logs" data-id="' + attr(inst.id) + '">' + (openLogs[inst.id] !== undefined ? "Hide logs" : "Logs") + "</button>");
+    if (inst.slot > 0) {
+      h.push('<button class="danger" data-action="remove-instance" data-id="' + attr(inst.id) + '" data-label="' + attr(inst.label) + '">Remove</button>');
+    }
+    h.push("</div>");
+
+    if (openLogs[inst.id] !== undefined) {
+      h.push('<pre class="logs" tabindex="0">' + esc(openLogs[inst.id] || "(empty)") + "</pre>");
+    }
+    h.push("</div>");
+    return h.join("");
+  }
+
+  function editFormHtml(project) {
+    function opt(list, current) {
+      return list.map(function (v) {
+        return '<option value="' + attr(v) + '"' + (v === current ? " selected" : "") + ">" + esc(v) + "</option>";
+      }).join("");
+    }
+    return '<form class="inline" data-form="edit-project" data-id="' + attr(project.id) + '">' +
+      '<label class="full"><span>start_cmd</span><input type="text" name="start_cmd" class="mono" value="' + attr(project.start_cmd || "") + '"></label>' +
+      '<div class="row">' +
+        '<label><span>port_mode</span><select name="port_mode">' + opt(["env", "arg", "fixed", "none"], project.port_mode) + "</select></label>" +
+        '<label><span>base_port</span><input type="number" name="base_port" min="1024" max="32767" value="' + attr(project.base_port === null || project.base_port === undefined ? "" : project.base_port) + '"></label>' +
+        '<label><span>open_path</span><input type="text" name="open_path" class="mono" value="' + attr(project.open_path || "/") + '"></label>' +
+        '<label><span>autostart</span><select name="autostart">' + opt(["schedule", "never"], project.autostart) + "</select></label>" +
+      "</div>" +
+      '<label class="full"><span>notes</span><input type="text" name="notes" value="' + attr(project.notes || "") + '"></label>' +
+      '<div class="row" style="justify-content:flex-end">' +
+        '<button type="button" data-action="cancel-edit" data-id="' + attr(project.id) + '">Cancel</button>' +
+        '<button type="submit" class="primary">Save project</button>' +
+      "</div></form>";
+  }
+
+  function projectCardHtml(project) {
+    var instances = project.instances || [];
+    var projectHit = matchesFilter(project, null);
+    var shown = projectHit ? instances : instances.filter(function (i) { return matchesFilter(project, i); });
+    if (!projectHit && shown.length === 0) { return ""; }
+    var anyRunning = instances.some(function (i) { return i.state === "running" || i.state === "starting"; });
+
+    var h = [];
+    h.push('<article class="card" data-project="' + attr(project.id) + '">');
+    h.push("<header>");
+    h.push("<h3>" + esc(project.name) + "</h3>");
+    h.push('<span class="badge' + (project.kind === "none" ? "" : " accent") + '">' + esc(project.kind) + "</span>");
+    if (project.base_port) { h.push('<span class="badge">base :' + esc(project.base_port) + "</span>"); }
+    h.push('<span class="spacer"></span>');
+    h.push('<button class="tiny ghost" data-action="pin" data-id="' + attr(project.id) + '" data-pinned="' + attr(project.pinned ? 1 : 0) +
+      '" title="' + (project.pinned ? "pinned: schedule and idle rule skip it" : "not pinned") + '" aria-pressed="' + (project.pinned ? "true" : "false") + '">' +
+      (project.pinned ? "📌 pinned" : "📍 pin") + "</button>");
+    h.push("</header>");
+    h.push('<div class="path" title="' + attr(project.path) + '"><bdi>' + esc(project.path) + "</bdi></div>");
+    if (project.notes) { h.push('<div class="notes">' + esc(project.notes) + "</div>"); }
+
+    h.push('<div class="insts">');
+    if (shown.length === 0) {
+      h.push('<div class="empty">no instances</div>');
+    } else {
+      shown.forEach(function (inst) { h.push(instanceHtml(project, inst)); });
+    }
+    h.push("</div>");
+
+    if (openEdit[project.id]) { h.push(editFormHtml(project)); }
+
+    h.push('<form class="inline" data-form="add-instance" data-id="' + attr(project.id) + '">' +
+      '<label style="flex:1 1 auto"><span>add worktree instance (label or absolute path)</span>' +
+      '<input type="text" name="label" class="mono" placeholder="fix-login-timeout" autocomplete="off"></label>' +
+      '<button type="submit" style="align-self:flex-end">Add</button></form>');
+
+    h.push('<div class="card-foot">');
+    h.push('<button data-action="edit" data-id="' + attr(project.id) + '">' + (openEdit[project.id] ? "Close edit" : "Edit") + "</button>");
+    h.push('<span class="spacer"></span>');
+    h.push('<span class="sub">' + esc(instances.length) + " instance" + (instances.length === 1 ? "" : "s") + "</span>");
+    h.push('<button class="danger" data-action="delete-project" data-id="' + attr(project.id) + '" data-name="' + attr(project.name) + '"' +
+      (anyRunning ? ' disabled title="stop the running instances first"' : "") + ">Delete</button>");
+    h.push("</div>");
+    h.push("</article>");
+    return h.join("");
+  }
+
+  function renderProjects(state) {
+    var projects = (state && state.projects) || [];
+    var cards = projects.map(projectCardHtml);
+    var visible = cards.filter(function (c) { return c !== ""; }).length;
+    q("#projects").innerHTML = cards.join("") || '<div class="empty">' +
+      (filterText ? "nothing matches the filter" : "no projects yet — use Register project") + "</div>";
+    var running = 0;
+    projects.forEach(function (p) {
+      (p.instances || []).forEach(function (i) { if (i.state === "running") { running++; } });
+    });
+    q("#projects-count").textContent = visible + "/" + projects.length + " shown · " + running + " running";
+  }
+
+  function projectOptions(state, selected) {
+    return ((state && state.projects) || []).map(function (p) {
+      return '<option value="' + attr(p.id) + '"' + (String(p.id) === String(selected) ? " selected" : "") + ">" + esc(p.name) + "</option>";
+    }).join("");
+  }
+
+  function renderObserved(state) {
+    var rows = ((state && state.observed) || []).slice().sort(function (a, b) { return (a.port || 0) - (b.port || 0); });
+    var instById = {};
+    ((state && state.projects) || []).forEach(function (p) {
+      (p.instances || []).forEach(function (i) { instById[i.id] = { project: p, inst: i }; });
+    });
+
+    var h = ["<thead><tr><th class=\"num\">Port</th><th>Bind</th><th class=\"num\">PID</th><th>Process</th><th>Project / instance</th><th>Seen</th><th>Actions</th></tr></thead><tbody>"];
+    if (rows.length === 0) {
+      h.push('<tr><td colspan="7" class="empty">nothing observed — press Reconcile</td></tr>');
+    }
+    rows.forEach(function (o) {
+      var unknownInProject = o.project_id && !o.instance_id;
+      var proc = o.container || shortUnit(o.unit) || o.comm || "";
+      var who;
+      if (o.instance_id && instById[o.instance_id]) {
+        var m = instById[o.instance_id];
+        who = esc(m.project.name) + " <span class=\"sub\">/</span> " + esc(m.inst.label);
+      } else if (unknownInProject) {
+        who = '<span class="badge amber">unknown in project</span> ' +
+          esc((((state.projects || []).filter(function (p) { return p.id === o.project_id; })[0]) || {}).name || ("#" + o.project_id));
+      } else {
+        who = '<span class="sub">unknown</span>';
+      }
+      var acts = [];
+      if (!o.instance_id) {
+        if (!o.project_id) {
+          acts.push('<select class="tiny" data-adopt-for="' + attr(o.port) + '" aria-label="project for port ' + attr(o.port) + '">' +
+            '<option value="">project…</option>' + projectOptions(state, "") + "</select>");
+        }
+        acts.push('<button class="tiny" data-action="adopt" data-port="' + attr(o.port) + '">Adopt</button>');
+      }
+      acts.push('<button class="tiny danger" data-action="observed-stop" data-port="' + attr(o.port) + '"' +
+        (o.pid ? "" : ' disabled title="no pid: root-owned socket"') + ">Stop</button>");
+
+      h.push('<tr' + (unknownInProject ? ' class="warn"' : "") + ">");
+      h.push('<td class="num">' + esc(o.port) + "</td>");
+      h.push('<td class="mono sub">' + esc(o.bind || "") + "</td>");
+      h.push('<td class="num">' + (o.pid ? esc(o.pid) : '<span class="sub">–</span>') + "</td>");
+      h.push('<td class="mono" title="' + attr(o.cmdline || o.cwd || "") + '">' + esc(proc) + "</td>");
+      h.push("<td>" + who + "</td>");
+      h.push('<td class="sub" title="' + attr(o.seen_at || "") + '">' + esc(fmtTs(o.seen_at)) + "</td>");
+      h.push('<td class="acts">' + acts.join(" ") + "</td>");
+      h.push("</tr>");
+    });
+    h.push("</tbody>");
+    q("#observed").innerHTML = h.join("");
+    var unknown = rows.filter(function (o) { return !o.instance_id; }).length;
+    q("#ports-count").textContent = rows.length + " listening · " + unknown + " unmatched";
+  }
+
+  function renderReserved(state) {
+    var rows = ((state && state.reserved) || []).slice().sort(function (a, b) { return (a.port || 0) - (b.port || 0); });
+    var h = ['<thead><tr><th class="num">Port</th><th>Label</th><th>Source</th><th>Updated</th></tr></thead><tbody>'];
+    if (rows.length === 0) { h.push('<tr><td colspan="4" class="empty">nothing reserved</td></tr>'); }
+    rows.forEach(function (r) {
+      h.push('<tr><td class="num">' + esc(r.port) + '</td><td>' + esc(r.label || "") +
+        '</td><td><span class="badge">' + esc(r.source || "") + '</span></td><td class="sub" title="' + attr(r.updated_at || "") + '">' +
+        esc(fmtTs(r.updated_at)) + "</td></tr>");
+    });
+    h.push("</tbody>");
+    q("#reserved").innerHTML = h.join("");
+    q("#reserved-count").textContent = rows.length + " ports the allocator skips";
+  }
+
+  function renderEvents(events) {
+    var h = ['<thead><tr><th>Time</th><th>Kind</th><th>Detail</th></tr></thead><tbody>'];
+    if (!events || events.length === 0) { h.push('<tr><td colspan="3" class="empty">no events</td></tr>'); }
+    (events || []).forEach(function (ev) {
+      h.push('<tr><td class="sub mono" title="' + attr(ev.ts || "") + '">' + esc(fmtTs(ev.ts)) +
+        '</td><td><span class="badge' + (/fail|error|crash/.test(ev.kind || "") ? " amber" : "") + '">' + esc(ev.kind) +
+        '</span></td><td class="mono sub">' + esc(fmtDetail(ev.detail)) + "</td></tr>");
+    });
+    h.push("</tbody>");
+    q("#events").innerHTML = h.join("");
+    q("#events-count").textContent = (events || []).length + " newest first";
+  }
+
+  function applyCollapsed() {
+    ["projects", "ports", "events", "reserved"].forEach(function (name) {
+      var sec = q('#sec-' + name);
+      if (!sec) { return; }
+      var isCollapsed = !!collapsed[name];
+      sec.setAttribute("data-collapsed", isCollapsed ? "1" : "0");
+      var btn = sec.querySelector('[data-action="collapse"][data-target="' + name + '"]');
+      if (btn) { btn.setAttribute("aria-expanded", isCollapsed ? "false" : "true"); }
+    });
+  }
+
+  function render(state, events) {
+    renderHeader(state);
+    renderProjects(state);
+    renderObserved(state);
+    renderReserved(state);
+    renderEvents(events);
+    applyCollapsed();
+  }
+
+  /* -------------------------------------------------------------- overlays */
+
+  function closeOverlays() {
+    q("#register").classList.remove("open");
+    q("#settings").classList.remove("open");
+    q("#backdrop").classList.remove("open");
+  }
+
+  function openRegister() {
+    var form = q("#register-form");
+    form.reset();
+    q("#suggestion").textContent = "";
+    q("#backdrop").classList.add("open");
+    q("#register").classList.add("open");
+    form.elements.path.focus();
+  }
+
+  function openSettings() {
+    var s = (STATE && STATE.settings) || {};
+    var form = q("#settings-form");
+    ["evening_stop", "morning_start", "morning_days", "idle_minutes", "pool_start", "pool_end", "memory_max"].forEach(function (k) {
+      if (form.elements[k]) { form.elements[k].value = s[k] === undefined || s[k] === null ? "" : s[k]; }
+    });
+    form.elements.notify_on_schedule.checked = String(s.notify_on_schedule) === "1";
+    var shown = { evening_stop: 1, morning_start: 1, morning_days: 1, idle_minutes: 1, pool_start: 1, pool_end: 1, memory_max: 1, notify_on_schedule: 1 };
+    var rest = Object.keys(s).filter(function (k) { return !shown[k]; }).map(function (k) {
+      return esc(k) + " = " + esc(s[k] === "" ? "–" : s[k]);
+    });
+    q("#settings-other").innerHTML = rest.length
+      ? "<b>Read-only here (CLI only):</b><br>" + rest.join("<br>") : "";
+    q("#backdrop").classList.add("open");
+    q("#settings").classList.add("open");
+    form.elements.evening_stop.focus();
+  }
+
+  /* --------------------------------------------------------------- actions */
+
+  function withPending(btn, work) {
+    if (!btn) { return work(); }
+    if (btn.dataset.busy === "1") { return Promise.resolve(); }
+    btn.dataset.busy = "1";
+    btn.disabled = true;
+    btn.classList.add("busy");
+    var done = function () {
+      if (btn.isConnected) {
+        btn.dataset.busy = "";
+        btn.disabled = false;
+        btn.classList.remove("busy");
+      }
+    };
+    return Promise.resolve().then(work).then(function (v) { done(); return v; },
+      function (err) { done(); throw err; });
+  }
+
+  function run(btn, work, okMessage) {
+    return withPending(btn, function () {
+      return Promise.resolve().then(work).then(function (result) {
+        if (okMessage) { toast(okMessage, "ok"); }
+        return refresh().then(function () { return result; });
+      });
+    }).catch(function (err) {
+      toast(err && err.message ? err.message : String(err), "err");
+    });
+  }
+
+  function copyLink(url) {
+    if (!url) { return; }
+    var fallback = function () {
+      try { window.prompt("Copy the URL:", url); } catch (e) { toast("Copy this: " + url, "ok"); }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () { toast("copied " + url, "ok"); }, fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  var ACTIONS = {
+    "reconcile": function (btn) {
+      // one Reconcile button, always the full pass (docker included)
+      return withPending(btn, function () {
+        return api.post("/api/reconcile", { quick: false }).then(function (state) {
+          STATE = state;
+          lastFetch = Date.now();
+          return api.get("/api/events?limit=50").catch(function () { return EVENTS; }).then(function (ev) {
+            EVENTS = Array.isArray(ev) ? ev : EVENTS;
+            render(STATE, EVENTS);
+            toast("reconciled", "ok");
+          });
+        });
+      }).catch(function (err) { toast("reconcile failed: " + err.message, "err"); });
+    },
+    "schedule-stop": function (btn) {
+      if (!window.confirm("Stop every running, unpinned, managed instance now?")) { return; }
+      return run(btn, function () { return api.post("/api/schedule/stop", {}); }, "evening stop done");
+    },
+    "schedule-start": function (btn) {
+      return run(btn, function () { return api.post("/api/schedule/start", {}); }, "morning set started");
+    },
+    "open-register": function () { openRegister(); },
+    "open-settings": function () { openSettings(); },
+    "close-overlays": function () { closeOverlays(); },
+    "collapse": function (btn) {
+      var name = btn.getAttribute("data-target");
+      collapsed[name] = !collapsed[name];
+      saveCollapsed();
+      applyCollapsed();
+    },
+    "pin": function (btn) {
+      var id = btn.getAttribute("data-id");
+      var next = btn.getAttribute("data-pinned") === "1" ? 0 : 1;
+      return run(btn, function () { return api.patch("/api/projects/" + id, { pinned: next }); },
+        next ? "pinned" : "unpinned");
+    },
+    "edit": function (btn) {
+      var id = btn.getAttribute("data-id");
+      openEdit[id] = !openEdit[id];
+      renderProjects(STATE);
+    },
+    "cancel-edit": function (btn) {
+      openEdit[btn.getAttribute("data-id")] = false;
+      renderProjects(STATE);
+    },
+    "delete-project": function (btn) {
+      var id = btn.getAttribute("data-id");
+      var name = btn.getAttribute("data-name");
+      if (!window.confirm("Delete project " + name + "? Instances are removed too; the checkout on disk is untouched.")) { return; }
+      return run(btn, function () { return api.del("/api/projects/" + id); }, "project " + name + " deleted");
+    },
+    "start": function (btn) {
+      var id = btn.getAttribute("data-id");
+      return run(btn, function () { return api.post("/api/instances/" + id + "/start", {}); }, "started");
+    },
+    "stop": function (btn) {
+      var id = btn.getAttribute("data-id");
+      return run(btn, function () { return api.post("/api/instances/" + id + "/stop", {}); }, "stopped");
+    },
+    "restart": function (btn) {
+      var id = btn.getAttribute("data-id");
+      return run(btn, function () { return api.post("/api/instances/" + id + "/restart", {}); }, "restarted");
+    },
+    "release": function (btn) {
+      var id = btn.getAttribute("data-id");
+      return run(btn, function () { return api.post("/api/instances/" + id + "/release", {}); }, "owner released");
+    },
+    "remove-instance": function (btn) {
+      var id = btn.getAttribute("data-id");
+      if (!window.confirm("Remove instance " + btn.getAttribute("data-label") + "? It is stopped first; the worktree on disk stays.")) { return; }
+      return run(btn, function () { return api.del("/api/instances/" + id); }, "instance removed");
+    },
+    "copy": function (btn) { copyLink(btn.getAttribute("data-url")); },
+    "logs": function (btn) {
+      var id = btn.getAttribute("data-id");
+      if (openLogs[id] !== undefined) {
+        delete openLogs[id];
+        renderProjects(STATE);
+        return;
+      }
+      return withPending(btn, function () {
+        return api.get("/api/instances/" + id + "/logs?lines=200").then(function (res) {
+          openLogs[id] = (res && (res.text !== undefined ? res.text : res.logs)) || "";
+          renderProjects(STATE);
+        });
+      }).catch(function (err) { toast("logs: " + err.message, "err"); });
+    },
+    "adopt": function (btn) {
+      var port = btn.getAttribute("data-port");
+      var sel = document.querySelector('[data-adopt-for="' + port + '"]');
+      var body = {};
+      if (sel) {
+        if (!sel.value) { toast("pick a project for port " + port + " first", "err"); return; }
+        body.project_id = Number(sel.value);
+      }
+      return run(btn, function () { return api.post("/api/observed/" + port + "/adopt", body); }, "port " + port + " adopted");
+    },
+    "observed-stop": function (btn) {
+      var port = btn.getAttribute("data-port");
+      if (!window.confirm("Stop whatever listens on port " + port + "?")) { return; }
+      return run(btn, function () { return api.post("/api/observed/" + port + "/stop", {}); }, "port " + port + " stopped");
+    },
+    "suggest": function (btn) {
+      var form = q("#register-form");
+      var path = form.elements.path.value.trim();
+      if (!path) { toast("fill the path first", "err"); form.elements.path.focus(); return; }
+      return withPending(btn, function () {
+        return api.get("/api/discover?path=" + encodeURIComponent(path)).then(function (s) {
+          if (!s) {
+            q("#suggestion").textContent = "no suggestion for this path";
+            return;
+          }
+          ["name", "kind", "start_cmd", "port_mode", "base_port"].forEach(function (k) {
+            if (s[k] !== undefined && s[k] !== null && form.elements[k]) { form.elements[k].value = s[k]; }
+          });
+          var ev = (s.evidence || []).map(function (e) { return "• " + esc(e); }).join("<br>");
+          q("#suggestion").innerHTML = "<b>Suggestion</b>" +
+            (s.confidence !== undefined ? " (confidence " + esc(s.confidence) + ")" : "") + (ev ? "<br>" + ev : "");
+        });
+      }).catch(function (err) { toast("discover: " + err.message, "err"); });
+    },
+    "submit-register": function (btn) {
+      var form = q("#register-form");
+      if (!form.reportValidity()) { return; }
+      var f = form.elements;
+      var path = f.path.value.trim();
+      if (path.charAt(0) !== "/") { toast("the path must be absolute", "err"); return; }
+      var body = { path: path, kind: f.kind.value, port_mode: f.port_mode.value, pinned: f.pinned.checked ? 1 : 0 };
+      if (f.name.value.trim()) { body.name = f.name.value.trim(); }
+      if (f.start_cmd.value.trim()) { body.start_cmd = f.start_cmd.value.trim(); }
+      if (f.base_port.value) { body.base_port = Number(f.base_port.value); }
+      return run(btn, function () {
+        return api.post("/api/projects", body).then(function (p) { closeOverlays(); return p; });
+      }, "project registered");
+    },
+    "submit-settings": function (btn) {
+      var form = q("#settings-form");
+      if (!form.reportValidity()) { return; }
+      var current = (STATE && STATE.settings) || {};
+      var body = {};
+      ["evening_stop", "morning_start", "morning_days", "idle_minutes", "pool_start", "pool_end", "memory_max"].forEach(function (k) {
+        var el = form.elements[k];
+        if (!el) { return; }
+        var v = String(el.value).trim();
+        if (v !== String(current[k] === undefined || current[k] === null ? "" : current[k])) { body[k] = v; }
+      });
+      var notify = form.elements.notify_on_schedule.checked ? "1" : "0";
+      if (notify !== String(current.notify_on_schedule)) { body.notify_on_schedule = notify; }
+      if (Object.keys(body).length === 0) { toast("nothing changed", "ok"); closeOverlays(); return; }
+      return run(btn, function () {
+        return api.post("/api/settings", body).then(function (s) { closeOverlays(); return s; });
+      }, "saved: " + Object.keys(body).join(", "));
+    }
+  };
+
+  /* --------------------------------------------------------------- events */
+
+  document.addEventListener("click", function (ev) {
+    var el = ev.target.closest ? ev.target.closest("[data-action]") : null;
+    if (!el) { return; }
+    var name = el.getAttribute("data-action");
+    if (!ACTIONS[name]) { return; }
+    if (el.tagName === "BUTTON" && el.disabled) { return; }
+    if (el.id === "backdrop" && ev.target !== el) { return; }
+    ev.preventDefault();
+    ACTIONS[name](el, ev);
+  });
+
+  document.addEventListener("submit", function (ev) {
+    var form = ev.target;
+    var kind = form.getAttribute("data-form");
+    if (!kind) { return; }
+    ev.preventDefault();
+    var btn = form.querySelector('button[type="submit"]');
+
+    if (kind === "add-instance") {
+      var value = form.elements.label.value.trim();
+      if (!value) { toast("give a worktree label or path", "err"); return; }
+      var body = value.charAt(0) === "/" ? { path: value } : { label: value };
+      run(btn, function () {
+        return api.post("/api/projects/" + form.getAttribute("data-id") + "/instances", body);
+      }, "instance added");
+      return;
+    }
+
+    if (kind === "edit-project") {
+      var id = form.getAttribute("data-id");
+      var f = form.elements;
+      var patch = {
+        start_cmd: f.start_cmd.value.trim() || null,
+        port_mode: f.port_mode.value,
+        base_port: f.base_port.value ? Number(f.base_port.value) : null,
+        open_path: f.open_path.value.trim() || "/",
+        autostart: f.autostart.value,
+        notes: f.notes.value.trim() || null
+      };
+      run(btn, function () {
+        return api.patch("/api/projects/" + id, patch).then(function (p) { openEdit[id] = false; return p; });
+      }, "project saved");
+      return;
+    }
+
+    if (kind === "register") { ACTIONS["submit-register"](q('[data-action="submit-register"]')); }
+    if (kind === "settings") { ACTIONS["submit-settings"](q('[data-action="submit-settings"]')); }
+  });
+
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Escape") { return; }
+    var openModal = q("#register").classList.contains("open") || q("#settings").classList.contains("open");
+    if (openModal) { closeOverlays(); return; }
+    var anyEdit = Object.keys(openEdit).some(function (k) { return openEdit[k]; });
+    var anyLogs = Object.keys(openLogs).length > 0;
+    if (anyEdit || anyLogs) {
+      openEdit = {};
+      openLogs = {};
+      renderProjects(STATE);
+    }
+  });
+
+  var filterEl = q("#filter");
+  filterEl.value = filterText;
+  var filterTimer = null;
+  filterEl.addEventListener("input", function () {
+    filterText = filterEl.value.trim();
+    store("filter", filterText);
+    // debounce only (a single one-shot timer per keystroke, never a poll)
+    if (filterTimer) { window.clearTimeout(filterTimer); }
+    filterTimer = window.setTimeout(function () { renderProjects(STATE); }, 80);
+  });
+
+  // Refresh when the tab comes back, but not more often than every 5 s.
+  // This is the ONLY re-fetch trigger besides explicit actions: no polling.
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState !== "visible") { return; }
+    if (Date.now() - lastFetch < 5000) { return; }
+    refresh();
+  });
+
+  document.addEventListener("DOMContentLoaded", function () {
+    applyCollapsed();
+    refresh();
+  });
+  if (document.readyState !== "loading") {
+    applyCollapsed();
+    refresh();
+  }
+})();
+</script>
+</body>
+</html>
