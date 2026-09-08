@@ -240,6 +240,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 base_port=suggestion.get("base_port"),
                 port_mode=suggestion.get("port_mode", "env"),
                 source="cli",
+                allow_busy=True,
             )
             resolved = registry.resolve_path(conn, cwd)
             project = resolved.project
@@ -421,6 +422,7 @@ def cmd_project_add(args: argparse.Namespace) -> int:
             base_port=args.port,
             port_mode=args.port_mode or "env",
             source="cli",
+            allow_busy=bool(getattr(args, "allow_busy", False)),
             **fields,
         )
     finally:
@@ -564,6 +566,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
                     base_port=item.get("base_port"),
                     port_mode=item.get("port_mode", "env"),
                     source="discover",
+                    allow_busy=True,
                 )
                 applied.append(project)
         finally:
@@ -643,7 +646,8 @@ def cmd_hook(args: argparse.Namespace) -> int:
 def cmd_install(args: argparse.Namespace) -> int:
     from . import install
 
-    return install.run(mcp=args.mcp, hooks=args.hooks, discover=args.discover, all=args.all)
+    return install.run(mcp=args.mcp, hooks=args.hooks, discover=args.discover, all=args.all,
+                       dry_run=args.dry_run)
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -744,6 +748,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int)
     p.add_argument("--port-mode", dest="port_mode", choices=list(config.PORT_MODES))
     p.add_argument("--pinned", action="store_true")
+    p.add_argument("--allow-busy", action="store_true",
+                   help="accept --port even if something already listens on it (e.g. the project itself)")
     p.set_defaults(func=cmd_project_add)
 
     p = project_sub.add_parser("edit")
@@ -799,6 +805,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_hook)
 
     p = sub.add_parser("install")
+    p.add_argument("--dry-run", action="store_true", help="print unit files and hook entries, change nothing")
     p.add_argument("--mcp", action="store_true")
     p.add_argument("--hooks", action="store_true")
     p.add_argument("--discover", action="store_true")

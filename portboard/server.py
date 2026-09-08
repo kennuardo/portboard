@@ -343,7 +343,10 @@ def _h_project_add(h: "Handler", m: re.Match):
     path = body.pop("path", None)
     if not path:
         raise ValueError("path is required")
-    return 201, _lazy("registry").add_project(h.conn(), path, source=body.pop("source", "gui"), **body)
+    allow_busy = bool(body.pop("allow_busy", False))
+    return 201, _lazy("registry").add_project(
+        h.conn(), path, source=body.pop("source", "gui"), allow_busy=allow_busy, **body
+    )
 
 
 def _h_project_patch(h: "Handler", m: re.Match):

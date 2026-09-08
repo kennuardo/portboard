@@ -1084,6 +1084,9 @@ td.acts { white-space: nowrap; }
       if (f.name.value.trim()) { body.name = f.name.value.trim(); }
       if (f.start_cmd.value.trim()) { body.start_cmd = f.start_cmd.value.trim(); }
       if (f.base_port.value) { body.base_port = Number(f.base_port.value); }
+      // A project registered from the GUI is often already running on its port:
+      // accept a busy port as long as no other registered project owns it.
+      body.allow_busy = true;
       return run(btn, function () {
         return api.post("/api/projects", body).then(function (p) { closeOverlays(); return p; });
       }, "project registered");

@@ -158,6 +158,7 @@ def session_start(conn, payload: dict) -> str | None:
                     base_port=suggestion.get("base_port"),
                     port_mode=suggestion.get("port_mode", "env"),
                     source="hook",
+                    allow_busy=True,
                 )
             except Exception:
                 log.exception("session_start: add_project failed for %s", cwd)

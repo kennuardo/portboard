@@ -382,6 +382,7 @@ def _install_discover(dry_run: bool) -> None:
                 base_port=item.get("base_port"),
                 port_mode=item.get("port_mode", "env"),
                 source="discover",
+                allow_busy=True,
             )
             print(f"discover: registered {path} ({item.get('name')})")
     finally:

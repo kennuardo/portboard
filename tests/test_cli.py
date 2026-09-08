@@ -63,8 +63,14 @@ class HelpAndErrorsTests(unittest.TestCase):
 class ProjectAddListTests(unittest.TestCase):
     def setUp(self) -> None:
         _reset_db()
-        self.tmp = tempfile.mkdtemp(prefix="portboard-test-cli-project-")
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+        base = tempfile.mkdtemp(prefix="portboard-test-cli-project-")
+        # registry.derive_name() lowercases the basename and replaces anything
+        # outside [a-z0-9-] with '-'; tempfile's random suffix can contain
+        # '_', so use a fixed alnum leaf name the derived project name matches
+        # exactly.
+        self.tmp = os.path.join(base, "cliprojectfixture")
+        os.makedirs(self.tmp)
+        self.addCleanup(shutil.rmtree, base, True)
 
     def test_add_then_list(self) -> None:
         # Ports must stay below 32768 (DESIGN.md rule 5, enforced by

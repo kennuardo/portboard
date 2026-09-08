@@ -335,7 +335,7 @@ def _tool_project_claim(conn, args: dict) -> dict:
         suggestion.pop("confidence", None)
         suggestion.pop("evidence", None)
         path = suggestion.pop("path", root)
-        project = registry.add_project(conn, path, source="mcp", **suggestion)
+        project = registry.add_project(conn, path, source="mcp", allow_busy=True, **suggestion)
         res = _resolved(conn, cwd)
 
     inst = getattr(res, "instance", None) if res else None
@@ -439,7 +439,10 @@ def _tool_project_register(conn, args: dict) -> dict:
     for key in ("name", "kind", "start_cmd", "base_port", "port_mode"):
         if args.get(key) is not None:
             fields[key] = args[key]
-    return registry.add_project(conn, path, source="mcp", **fields)
+    # A port discovered in the repo may already be held by the project's own
+    # dev server; only an explicit caller-supplied port is checked strictly.
+    allow_busy = args.get("base_port") is None
+    return registry.add_project(conn, path, source="mcp", allow_busy=allow_busy, **fields)
 
 
 TOOL_IMPLS = {
