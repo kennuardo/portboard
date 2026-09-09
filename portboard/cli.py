@@ -545,6 +545,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
     suggestions = discover.scan(root)
 
     applied: list[dict] = []
+    skipped: list[dict] = []
     if args.apply:
         from . import registry
 
@@ -557,23 +558,29 @@ def cmd_discover(args: argparse.Namespace) -> int:
                 path = item.get("path")
                 if not path or path in existing_paths:
                     continue
-                project = registry.add_project(
-                    conn,
-                    path,
-                    name=item.get("name"),
-                    kind=item.get("kind", "transient"),
-                    start_cmd=item.get("start_cmd"),
-                    base_port=item.get("base_port"),
-                    port_mode=item.get("port_mode", "env"),
-                    source="discover",
-                    allow_busy=True,
-                )
+                try:
+                    project = registry.add_project(
+                        conn,
+                        path,
+                        name=item.get("name"),
+                        kind=item.get("kind", "transient"),
+                        start_cmd=item.get("start_cmd"),
+                        base_port=item.get("base_port"),
+                        port_mode=item.get("port_mode", "env"),
+                        source="discover",
+                        allow_busy=True,
+                    )
+                except (ValueError, registry.RegistryError) as exc:
+                    # one bad suggestion (duplicate port, clashing name) must not
+                    # abort the whole import — report it and keep going
+                    skipped.append({"path": path, "name": item.get("name"), "error": str(exc)})
+                    continue
                 applied.append(project)
         finally:
             conn.close()
 
     if args.json:
-        _print_json({"suggestions": suggestions, "applied": applied})
+        _print_json({"suggestions": suggestions, "applied": applied, "skipped": skipped})
         return 0
 
     _print_table(
@@ -585,6 +592,8 @@ def cmd_discover(args: argparse.Namespace) -> int:
     )
     if applied:
         print(f"registered {len(applied)} project(s)")
+    for item in skipped:
+        print(f"skipped {item['name']} ({item['path']}): {item['error']}", file=sys.stderr)
     return 0
 
 

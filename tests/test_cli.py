@@ -102,3 +102,54 @@ class ProjectAddListTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_REGISTRY_AVAILABLE, "portboard.registry not importable yet")
+class DiscoverApplyTests(unittest.TestCase):
+    """One rejected suggestion must not abort ``discover --apply``."""
+
+    def setUp(self) -> None:
+        _reset_db()
+        self.tmp = tempfile.mkdtemp(prefix="portboard-test-discover-apply-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _suggestions(self) -> list[dict]:
+        rows = []
+        for name, port in (("alpha", 4321), ("beta", 4321), ("gamma", 4322)):
+            path = os.path.join(self.tmp, name)
+            os.makedirs(path, exist_ok=True)
+            rows.append({"path": path, "name": name, "kind": "transient", "confidence": "high",
+                         "start_cmd": "npm run dev", "base_port": port, "port_mode": "env", "evidence": []})
+        return rows
+
+    def test_apply_skips_conflicts_and_continues(self) -> None:
+        from unittest import mock
+        from portboard import discover, registry
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(discover, "scan", return_value=self._suggestions()):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = main(["discover", "--apply"])
+        self.assertEqual(rc, 0)
+        self.assertIn("registered 2 project(s)", out.getvalue())
+        self.assertIn("skipped beta", err.getvalue())
+        conn = db.connect()
+        try:
+            names = sorted(p["name"] for p in registry.list_projects(conn))
+        finally:
+            conn.close()
+        self.assertEqual(names, ["alpha", "gamma"])
+
+    def test_apply_json_lists_skipped(self) -> None:
+        import json
+        from unittest import mock
+        from portboard import discover
+
+        out = io.StringIO()
+        with mock.patch.object(discover, "scan", return_value=self._suggestions()):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                rc = main(["--json", "discover", "--apply"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out.getvalue())
+        self.assertEqual([p["name"] for p in payload["applied"]], ["alpha", "gamma"])
+        self.assertEqual([s["name"] for s in payload["skipped"]], ["beta"])
