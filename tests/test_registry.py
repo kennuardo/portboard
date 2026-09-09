@@ -135,6 +135,34 @@ class TestProjects(RegistryTestCase):
         self.assertEqual([], registry.list_instances(self.conn))
 
 
+class TestOrder(RegistryTestCase):
+    def test_list_follows_manual_order_then_name(self):
+        a, b, c = self.add("alpha"), self.add("beta"), self.add("gamma")
+        self.assertEqual([p["name"] for p in registry.list_projects(self.conn)], ["alpha", "beta", "gamma"])
+        registry.reorder_projects(self.conn, [c["id"], a["id"]])
+        self.assertEqual([p["name"] for p in registry.list_projects(self.conn)], ["gamma", "alpha", "beta"])
+        orders = {p["name"]: p["sort_order"] for p in registry.list_projects(self.conn)}
+        self.assertEqual(orders, {"gamma": 0, "alpha": 1, "beta": 2})
+
+    def test_reorder_rejects_unknown_and_bad_ids(self):
+        self.add("alpha")
+        with self.assertRaises(ValueError):
+            registry.reorder_projects(self.conn, [999])
+        with self.assertRaises(ValueError):
+            registry.reorder_projects(self.conn, ["x"])
+
+    def test_old_database_gains_the_column(self):
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT)")
+        db._migrate(conn)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
+        self.assertIn("sort_order", cols)
+        db._migrate(conn)  # idempotent
+        conn.close()
+
+
 class TestInstances(RegistryTestCase):
     def setUp(self):
         super().setUp()

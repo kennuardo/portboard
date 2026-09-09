@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS projects (
   memory_max   TEXT,                          -- MemoryMax override (defaults to settings.memory_max)
   source       TEXT NOT NULL DEFAULT 'cli',   -- cli | gui | mcp | hook | discover | adopted
   notes        TEXT,
+  sort_order   INTEGER NOT NULL DEFAULT 0, -- manual position in the GUI list (lower first, ties by name)
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL
 );
@@ -128,9 +129,24 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     for key, value in config.DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value))
     return conn
+
+
+# columns added after the first release: (table, column, DDL) — CREATE TABLE IF
+# NOT EXISTS does not touch an existing table, so they are added here
+_ADDED_COLUMNS = (
+    ("projects", "sort_order", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in _ADDED_COLUMNS:
+        present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def get_setting(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:

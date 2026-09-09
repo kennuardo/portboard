@@ -470,6 +470,8 @@ def cmd_project_edit(args: argparse.Namespace) -> int:
             fields["port_mode"] = args.port_mode
         if args.pinned:
             fields["pinned"] = 1
+        if args.order is not None:
+            fields["sort_order"] = args.order
         if fields:
             project = registry.update_project(conn, project["id"], **fields)
             if "base_port" in fields or "kind" in fields:
@@ -785,6 +787,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int)
     p.add_argument("--port-mode", dest="port_mode", choices=list(config.PORT_MODES))
     p.add_argument("--pinned", action="store_true")
+    p.add_argument("--order", type=int, help="manual position in the GUI list (lower first)")
     p.set_defaults(func=cmd_project_edit)
 
     p = project_sub.add_parser("rm")

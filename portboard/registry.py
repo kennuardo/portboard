@@ -290,7 +290,7 @@ def get_project(conn: sqlite3.Connection, ref: int | str) -> dict | None:
 
 
 def list_projects(conn: sqlite3.Connection, with_instances: bool = False) -> list[dict]:
-    projects = db.rows(conn.execute("SELECT * FROM projects ORDER BY name"))
+    projects = db.rows(conn.execute("SELECT * FROM projects ORDER BY sort_order, name"))
     if not with_instances:
         return projects
     by_id = {p["id"]: p for p in projects}
@@ -690,6 +690,31 @@ def find_by_ref(conn: sqlite3.Connection, ref: int | str) -> dict:
     if row is None:
         raise RegistryError(f"project {name!r} has no instance {label!r}")
     return _instance_view(conn, dict(row), project)
+
+
+def reorder_projects(conn: sqlite3.Connection, ids: list[int]) -> list[dict]:
+    """Set the manual order: ``ids`` get positions 0..n-1 in that sequence,
+    projects not listed keep their relative order after them."""
+    wanted: list[int] = []
+    for raw in ids:
+        try:
+            pid = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"project id must be an integer, got {raw!r}")
+        if pid not in wanted:
+            wanted.append(pid)
+    known = [r["id"] for r in conn.execute("SELECT id FROM projects ORDER BY sort_order, name")]
+    missing = [pid for pid in wanted if pid not in known]
+    if missing:
+        raise ValueError(f"unknown project id(s): {missing}")
+    sequence = wanted + [pid for pid in known if pid not in wanted]
+    ts = db.now()
+    with conn:
+        for position, pid in enumerate(sequence):
+            conn.execute("UPDATE projects SET sort_order = ?, updated_at = ? WHERE id = ? AND sort_order != ?",
+                         (position, ts, pid, position))
+    db.add_event(conn, "project.reorder", {"ids": sequence})
+    return list_projects(conn)
 
 
 # --------------------------------------------------------------------------

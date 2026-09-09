@@ -44,6 +44,7 @@ def make_fake_modules() -> dict[str, types.ModuleType]:
         "projects": [], "observed": [], "reserved": [], "settings": {}, "reconciled_at": None,
     })
     registry.get_project = mock.MagicMock(return_value=None)
+    registry.reorder_projects = mock.MagicMock(return_value=[])
     registry.add_project = mock.MagicMock(return_value={"id": 1, "name": "demo"})
     registry.update_project = mock.MagicMock(return_value={"id": 1, "name": "demo"})
     registry.delete_project = mock.MagicMock(return_value=None)
@@ -194,6 +195,19 @@ class HealthAndStateTest(ServerTestCase):
         _, kwargs = self.reconcile.reconcile.call_args
         self.assertTrue(kwargs["quick"])
         self.assertTrue(kwargs["adopt_unknown"])
+
+    def test_project_order_calls_registry_and_returns_state(self):
+        status, _, payload = self.json_req("POST", "/api/projects/order", {"ids": [3, 1, 2]})
+        self.assertEqual(status, 200)
+        self.assertIn("projects", payload)
+        args, _ = self.registry.reorder_projects.call_args
+        self.assertEqual(args[1], [3, 1, 2])
+
+    def test_project_order_rejects_non_list(self):
+        status, _, payload = self.json_req("POST", "/api/projects/order", {"ids": "3,1,2"})
+        self.assertEqual(status, 400)
+        self.assertIn("ids", payload["error"])
+        self.registry.reorder_projects.assert_not_called()
 
     def test_state_quick_reconciles_a_stale_snapshot(self):
         self.registry.state_snapshot.return_value["reconciled_at"] = "2026-09-08T10:00:00"

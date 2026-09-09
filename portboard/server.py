@@ -383,6 +383,15 @@ def _h_project_add(h: "Handler", m: re.Match):
     return 201, fresh if isinstance(fresh, dict) else project
 
 
+def _h_project_order(h: "Handler", m: re.Match):
+    body = h.body()
+    ids = body.get("ids")
+    if not isinstance(ids, list):
+        raise ValueError("ids must be a list of project ids")
+    _lazy("registry").reorder_projects(h.conn(), ids)
+    return _state(h, h.conn())
+
+
 def _h_project_patch(h: "Handler", m: re.Match):
     fields = dict(h.body())
     fields.pop("id", None)
@@ -619,6 +628,7 @@ ROUTES: list[tuple[str, re.Pattern, Callable]] = [
     ("POST", re.compile(r"^/api/reconcile$"), _h_reconcile),
     ("GET", re.compile(r"^/api/events$"), _h_events),
     ("POST", re.compile(r"^/api/projects$"), _h_project_add),
+    ("POST", re.compile(r"^/api/projects/order$"), _h_project_order),
     ("PATCH", re.compile(r"^/api/projects/(\d+)$"), _h_project_patch),
     ("DELETE", re.compile(r"^/api/projects/(\d+)$"), _h_project_delete),
     ("POST", re.compile(r"^/api/projects/(\d+)/instances$"), _h_project_instances),
