@@ -21,6 +21,8 @@ os.environ["PORTBOARD_STATE_DIR"] = _STATE_DIR
 
 from portboard import config, db, server  # noqa: E402
 
+from tests import assert_isolated  # noqa: E402
+
 # Keep unittest output clean: the server logs handled errors on purpose.
 logging.getLogger("portboard").addHandler(logging.NullHandler())
 logging.getLogger("portboard").propagate = False
@@ -404,6 +406,7 @@ class DbBackedTest(ServerTestCase):
 
     def setUp(self):
         super().setUp()
+        assert_isolated()
         conn = db.connect()
         try:
             conn.execute("DELETE FROM observed")

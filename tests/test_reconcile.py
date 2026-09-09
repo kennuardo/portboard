@@ -281,6 +281,8 @@ class QuickModeDockerBackedTests(unittest.TestCase):
         import sqlite3, tempfile, os, json
         from unittest import mock
         from portboard import db, reconcile
+        from tests import assert_isolated
+        assert_isolated()
         tmp = tempfile.mkdtemp()
         conn = db.connect()
         ts = db.now()

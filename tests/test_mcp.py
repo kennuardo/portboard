@@ -20,6 +20,8 @@ os.environ["PORTBOARD_STATE_DIR"] = _STATE_DIR
 
 from portboard import config, db, mcp  # noqa: E402
 
+from tests import assert_isolated  # noqa: E402
+
 logging.getLogger("portboard").addHandler(logging.NullHandler())
 logging.getLogger("portboard").propagate = False
 
@@ -312,6 +314,7 @@ class CallToolTest(FakeModuleTestCase):
         self.assertTrue(kwargs["quick"])
 
     def test_ports_list_reconciles_quickly_first(self):
+        assert_isolated()
         conn = db.connect()
         try:
             conn.execute("DELETE FROM observed")
