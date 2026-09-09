@@ -371,6 +371,14 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
                 fields["stopped_at"] = None
                 fields["stopped_by"] = None
                 fields["started_at"] = inst["started_at"] or ts if inst["state"] == "starting" else ts
+                if inst["state"] != "starting" and not inst["unit"]:
+                    # nobody here started it (the runner always records its unit
+                    # first): it is the user's own service, so remember what runs
+                    # it and never treat its disappearance as a crash
+                    fields["managed"] = 0
+                    backing = meta.get("unit") or meta.get("container")
+                    if backing:
+                        fields["unit"] = backing
             sets = ", ".join(f"{k} = ?" for k in fields)
             conn.execute(f"UPDATE instances SET {sets} WHERE id = ?", [*fields.values(), inst_id])
 

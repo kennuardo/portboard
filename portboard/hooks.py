@@ -163,6 +163,10 @@ def session_start(conn, payload: dict) -> str | None:
             except Exception:
                 log.exception("session_start: add_project failed for %s", cwd)
                 return None
+            try:  # the quick pass above ran before this project existed
+                reconcile.reconcile(conn, quick=True)
+            except Exception:
+                log.exception("session_start: reconcile after add_project failed")
             resolved = registry.resolve_path(conn, cwd)
             project = getattr(resolved, "project", None)
             if project is None:

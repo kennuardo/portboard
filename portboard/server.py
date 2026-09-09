@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -32,6 +33,11 @@ from typing import Any, Callable
 from . import config, db
 
 log = logging.getLogger("portboard.server")
+
+# /api/state refreshes the snapshot with a quick (ss-only, ~70 ms) reconcile when
+# it is older than this. The GUI itself re-fetches only on load and on tab
+# visibility (5 s floor), so this bounds the work to one ss pass per 15 s.
+STATE_RECONCILE_MAX_AGE = 15
 
 MAX_BODY = 1024 * 1024
 IDLE_TICK_SECONDS = 60
@@ -307,7 +313,29 @@ def _h_healthz(h: "Handler", m: re.Match):
     }
 
 
-def _state(h: "Handler", conn) -> dict:
+def _snapshot_stale(conn, max_age: float = STATE_RECONCILE_MAX_AGE) -> bool:
+    """True when the last reconcile is missing, unparsable or older than max_age s."""
+    stamp = db.get_setting(conn, "reconciled_at")
+    if not stamp:
+        return True
+    try:
+        then = datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return True
+    return (datetime.now() - then).total_seconds() > max_age
+
+
+def _quick_reconcile(conn) -> None:
+    """Best-effort ss-only reconcile; a failure must never break the caller's reply."""
+    try:
+        _lazy("reconcile").reconcile(conn, quick=True)
+    except Exception:
+        log.exception("quick reconcile failed")
+
+
+def _state(h: "Handler", conn, refresh: bool = False) -> dict:
+    if refresh and _snapshot_stale(conn):
+        _quick_reconcile(conn)
     registry = _lazy("registry")
     state = dict(registry.state_snapshot(conn))
     state["daemon"] = h.server.daemon_info()
@@ -315,7 +343,7 @@ def _state(h: "Handler", conn) -> dict:
 
 
 def _h_state(h: "Handler", m: re.Match):
-    return _state(h, h.conn())
+    return _state(h, h.conn(), refresh=True)
 
 
 def _h_reconcile(h: "Handler", m: re.Match):
@@ -344,17 +372,28 @@ def _h_project_add(h: "Handler", m: re.Match):
     if not path:
         raise ValueError("path is required")
     allow_busy = bool(body.pop("allow_busy", False))
-    return 201, _lazy("registry").add_project(
-        h.conn(), path, source=body.pop("source", "gui"), allow_busy=allow_busy, **body
+    conn = h.conn()
+    project = _lazy("registry").add_project(
+        conn, path, source=body.pop("source", "gui"), allow_busy=allow_busy, **body
     )
+    # match an already-running dev server to the new instance right away
+    _quick_reconcile(conn)
+    fresh = _lazy("registry").get_project(conn, project["id"])
+    return 201, fresh if isinstance(fresh, dict) else project
 
 
 def _h_project_patch(h: "Handler", m: re.Match):
     fields = dict(h.body())
     fields.pop("id", None)
-    project = _lazy("registry").update_project(h.conn(), int(m.group(1)), **fields)
+    conn = h.conn()
+    project = _lazy("registry").update_project(conn, int(m.group(1)), **fields)
     if project is None:
         raise NotFound(f"project {m.group(1)} not found")
+    if "base_port" in fields or "path" in fields or "kind" in fields:
+        _quick_reconcile(conn)
+        fresh = _lazy("registry").get_project(conn, project["id"])
+        if isinstance(fresh, dict):
+            project = fresh
     return project
 
 

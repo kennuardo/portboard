@@ -194,6 +194,38 @@ class HealthAndStateTest(ServerTestCase):
         self.assertTrue(kwargs["quick"])
         self.assertTrue(kwargs["adopt_unknown"])
 
+    def test_state_quick_reconciles_a_stale_snapshot(self):
+        self.registry.state_snapshot.return_value["reconciled_at"] = "2026-09-08T10:00:00"
+        status, _, _ = self.json_req("GET", "/api/state")
+        self.assertEqual(status, 200)
+        self.reconcile.reconcile.assert_called_once()
+        _, kwargs = self.reconcile.reconcile.call_args
+        self.assertTrue(kwargs["quick"])
+
+    def test_state_skips_reconcile_when_snapshot_is_fresh(self):
+        from datetime import datetime
+        conn = db.connect()
+        try:
+            db.set_setting(conn, "reconciled_at", datetime.now().replace(microsecond=0).isoformat())
+        finally:
+            conn.close()
+        status, _, _ = self.json_req("GET", "/api/state")
+        self.assertEqual(status, 200)
+        self.reconcile.reconcile.assert_not_called()
+
+    def test_state_survives_a_failing_quick_reconcile(self):
+        self.reconcile.reconcile.side_effect = RuntimeError("ss exploded")
+        status, _, payload = self.json_req("GET", "/api/state")
+        self.assertEqual(status, 200)
+        self.assertIn("projects", payload)
+
+    def test_project_add_reconciles_quickly(self):
+        status, _, payload = self.json_req("POST", "/api/projects", {"path": "/repo/new"})
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["name"], "demo")
+        self.reconcile.reconcile.assert_called_once()
+        self.assertTrue(self.reconcile.reconcile.call_args.kwargs["quick"])
+
     def test_daemon_reports_idle_countdown_when_socket_activated(self):
         self.srv.socket_activated = True
         _, _, payload = self.json_req("GET", "/api/state")

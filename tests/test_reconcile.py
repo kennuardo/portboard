@@ -111,6 +111,26 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(self.instance(2)["actual_port"], 4001)
         self.assertEqual(self.observed(4001)["instance_id"], 2)
 
+    def test_listener_nobody_here_started_becomes_unmanaged_with_its_unit(self):
+        # instance 2 has no unit: the runner never started it, the user's own
+        # systemd service is serving its port
+        self.listeners = [listener(4001, pid=222, comm="python")]
+        self.procs = {222: proc(222, cwd=str(self.wt), unit="dots-tts.service", comm="python")}
+        summary = self.run_reconcile(quick=True)
+        self.assertEqual(summary["started"], [2])
+        inst = self.instance(2)
+        self.assertEqual((inst["state"], inst["managed"], inst["unit"]), ("running", 0, "dots-tts.service"))
+        # ...and the one the runner did start keeps its flag
+        self.assertEqual(self.instance(1)["managed"], 1)
+
+    def test_starting_instance_keeps_managed_flag_when_it_comes_up(self):
+        self.conn.execute("UPDATE instances SET state='starting', unit=NULL WHERE id=2")
+        self.listeners = [listener(4001, pid=222, comm="node")]
+        self.procs = {222: proc(222, cwd=str(self.wt))}
+        self.run_reconcile(quick=True)
+        inst = self.instance(2)
+        self.assertEqual((inst["state"], inst["managed"]), ("running", 1))
+
     def test_running_instance_that_vanished_is_a_crash(self):
         self.conn.execute("UPDATE instances SET state='running', pid=999 WHERE id=1")
         summary = self.run_reconcile(quick=True)

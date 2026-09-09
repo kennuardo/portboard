@@ -442,7 +442,14 @@ def _tool_project_register(conn, args: dict) -> dict:
     # A port discovered in the repo may already be held by the project's own
     # dev server; only an explicit caller-supplied port is checked strictly.
     allow_busy = args.get("base_port") is None
-    return registry.add_project(conn, path, source="mcp", allow_busy=allow_busy, **fields)
+    project = registry.add_project(conn, path, source="mcp", allow_busy=allow_busy, **fields)
+    try:  # match an already-running dev server to the new instance right away
+        _lazy("reconcile").reconcile(conn, quick=True)
+    except Exception:
+        log.exception("project_register: quick reconcile failed")
+        return project
+    fresh = registry.get_project(conn, project["id"])
+    return fresh if isinstance(fresh, dict) else project
 
 
 TOOL_IMPLS = {

@@ -405,6 +405,19 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reconcile_after_change(conn, registry, project: dict | None) -> dict | None:
+    """Quick reconcile so an already-running server is matched at once; best effort."""
+    if project is None:
+        return None
+    try:
+        from . import reconcile
+        reconcile.reconcile(conn, quick=True)
+    except Exception as exc:  # the registration itself succeeded
+        print(f"warning: quick reconcile failed: {exc}", file=sys.stderr)
+        return project
+    return registry.get_project(conn, project["id"]) or project
+
+
 def cmd_project_add(args: argparse.Namespace) -> int:
     from . import registry
 
@@ -425,6 +438,7 @@ def cmd_project_add(args: argparse.Namespace) -> int:
             allow_busy=bool(getattr(args, "allow_busy", False)),
             **fields,
         )
+        project = _reconcile_after_change(conn, registry, project)
     finally:
         conn.close()
 
@@ -458,6 +472,8 @@ def cmd_project_edit(args: argparse.Namespace) -> int:
             fields["pinned"] = 1
         if fields:
             project = registry.update_project(conn, project["id"], **fields)
+            if "base_port" in fields or "kind" in fields:
+                project = _reconcile_after_change(conn, registry, project)
     finally:
         conn.close()
 
