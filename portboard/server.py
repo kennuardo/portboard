@@ -339,6 +339,7 @@ def _state(h: "Handler", conn, refresh: bool = False) -> dict:
     registry = _lazy("registry")
     state = dict(registry.state_snapshot(conn))
     state["daemon"] = h.server.daemon_info()
+    state["projects_root"] = str(config.PROJECTS_ROOT)
     return state
 
 

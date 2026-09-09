@@ -155,6 +155,8 @@ input[type=text], input[type=search], input[type=number], input[type=time], sele
 }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 #filter { width: 260px; max-width: 46vw; }
+.chk { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--faint); cursor: pointer; }
+.chk input { margin: 0; }
 
 /* ----------------------------------------------------------------- cards */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
@@ -319,6 +321,10 @@ td.acts { white-space: nowrap; }
         <span class="caret">&#9662;</span> Ports
       </button></h2>
       <span class="count" id="ports-count"></span>
+      <div class="spacer"></div>
+      <label class="chk" title="hide listeners whose process does not run from the projects root">
+        <input type="checkbox" id="ports-projects-only"> only <span class="mono" id="ports-root">/mnt/hyper/Projects</span>
+      </label>
     </div>
     <div class="sec-body">
       <div class="tablewrap"><table id="observed"></table></div>
@@ -566,6 +572,8 @@ td.acts { white-space: nowrap; }
   var openLogs = {};           // instance id -> log text, present = panel open
   var openEdit = {};           // project id -> true while the edit form is open
   var filterText = store("filter") || "";
+  // Ports table: show only listeners running from the projects root (default on)
+  var portsProjectsOnly = store("portsProjectsOnly") === null ? true : store("portsProjectsOnly") === "1";
   var collapsed = {};
   try { collapsed = JSON.parse(store("collapsed") || "{}") || {}; } catch (e) { collapsed = {}; }
   if (collapsed.reserved === undefined) { collapsed.reserved = true; }
@@ -792,18 +800,36 @@ td.acts { white-space: nowrap; }
     return 2;                                 // unknown listener
   }
 
+  function underRoot(path, root) {
+    return !!path && (path === root || path.indexOf(root + "/") === 0);
+  }
+
   function renderObserved(state) {
-    var rows = ((state && state.observed) || []).slice().sort(function (a, b) {
+    var all = ((state && state.observed) || []).slice().sort(function (a, b) {
       return (observedRank(a) - observedRank(b)) || ((a.port || 0) - (b.port || 0));
     });
     var instById = {};
+    var projById = {};
     ((state && state.projects) || []).forEach(function (p) {
+      projById[p.id] = p;
       (p.instances || []).forEach(function (i) { instById[i.id] = { project: p, inst: i }; });
     });
+    var root = (state && state.projects_root) || "/mnt/hyper/Projects";
+    q("#ports-root").textContent = root;
+    q("#ports-projects-only").checked = portsProjectsOnly;
+    function fromProjects(o) {
+      // a process inside a container reports /app; its compose workdir says where it really lives
+      if (underRoot(o.cwd, root) || underRoot(o.compose_workdir, root)) { return true; }
+      var p = (o.instance_id && instById[o.instance_id]) ? instById[o.instance_id].project : projById[o.project_id];
+      return !!p && underRoot(p.path, root);
+    }
+    var rows = portsProjectsOnly ? all.filter(fromProjects) : all;
 
     var h = ["<thead><tr><th class=\"num\">Port</th><th>Bind</th><th class=\"num\">PID</th><th>Process</th><th>Project / instance</th><th>Seen</th><th>Actions</th></tr></thead><tbody>"];
     if (rows.length === 0) {
-      h.push('<tr><td colspan="7" class="empty">nothing observed — press Reconcile</td></tr>');
+      h.push('<tr><td colspan="7" class="empty">' + (all.length
+        ? "nothing listening from " + esc(root) + " — untick the filter to see all " + all.length
+        : "nothing observed — press Reconcile") + "</td></tr>");
     }
     rows.forEach(function (o) {
       var unknownInProject = o.project_id && !o.instance_id;
@@ -842,7 +868,8 @@ td.acts { white-space: nowrap; }
     h.push("</tbody>");
     q("#observed").innerHTML = h.join("");
     var unknown = rows.filter(function (o) { return !o.instance_id; }).length;
-    q("#ports-count").textContent = rows.length + " listening · " + unknown + " unmatched";
+    q("#ports-count").textContent = (portsProjectsOnly ? rows.length + "/" + all.length + " shown" : all.length + " listening") +
+      " · " + unknown + " unmatched";
   }
 
   function renderReserved(state) {
@@ -1190,6 +1217,12 @@ td.acts { white-space: nowrap; }
       openLogs = {};
       renderProjects(STATE);
     }
+  });
+
+  q("#ports-projects-only").addEventListener("change", function (ev) {
+    portsProjectsOnly = !!ev.target.checked;
+    store("portsProjectsOnly", portsProjectsOnly ? "1" : "0");
+    renderObserved(STATE);
   });
 
   var filterEl = q("#filter");

@@ -177,8 +177,9 @@ class HealthAndStateTest(ServerTestCase):
         }
         status, _, payload = self.json_req("GET", "/api/state")
         self.assertEqual(status, 200)
-        for key in ("projects", "observed", "reserved", "settings", "reconciled_at", "daemon"):
+        for key in ("projects", "observed", "reserved", "settings", "reconciled_at", "daemon", "projects_root"):
             self.assertIn(key, payload)
+        self.assertEqual(payload["projects_root"], str(config.PROJECTS_ROOT))
         daemon = payload["daemon"]
         self.assertEqual(set(daemon), {"pid", "version", "socket_activated", "uptime_s", "idle_exit_in_s"})
         self.assertIsNone(daemon["idle_exit_in_s"])  # not socket activated
