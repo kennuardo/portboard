@@ -155,8 +155,16 @@ input[type=text], input[type=search], input[type=number], input[type=time], sele
 }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 #filter { width: 260px; max-width: 46vw; }
-.card header .order { display: inline-flex; gap: 0; }
-.card header .order button { padding: 2px 5px; font-size: 10px; line-height: 1; }
+.card > header .grip {
+  cursor: grab; color: var(--faint); font-size: 15px; line-height: 1; padding: 2px 4px; border-radius: 4px;
+  user-select: none; -webkit-user-select: none; touch-action: none;
+}
+.card > header .grip:hover, .card > header .grip:focus-visible { color: var(--text); background: var(--accent-soft); outline: none; }
+.card.dragging { opacity: .35; }
+.card.drop-before { box-shadow: -4px 0 0 0 var(--accent), var(--shadow); }
+.card.drop-after { box-shadow: 4px 0 0 0 var(--accent), var(--shadow); }
+.grid.stacked .card.drop-before { box-shadow: 0 -4px 0 0 var(--accent), var(--shadow); }
+.grid.stacked .card.drop-after { box-shadow: 0 4px 0 0 var(--accent), var(--shadow); }
 .chk { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--faint); cursor: pointer; }
 .chk input { margin: 0; }
 
@@ -440,6 +448,7 @@ td.acts { white-space: nowrap; }
   }
   function attr(v) { return esc(v); }
   function q(sel, root) { return (root || document).querySelector(sel); }
+  function qa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
 
   function store(key, value) {
     try {
@@ -736,10 +745,8 @@ td.acts { white-space: nowrap; }
     h.push('<span class="badge' + (project.kind === "none" ? "" : " accent") + '">' + esc(project.kind) + "</span>");
     if (project.base_port) { h.push('<span class="badge">base :' + esc(project.base_port) + "</span>"); }
     h.push('<span class="spacer"></span>');
-    h.push('<span class="order"><button class="tiny ghost" data-action="move-up" data-id="' + attr(project.id) +
-      '" title="move up in the list" aria-label="move ' + attr(project.name) + ' up">&#9650;</button>' +
-      '<button class="tiny ghost" data-action="move-down" data-id="' + attr(project.id) +
-      '" title="move down in the list" aria-label="move ' + attr(project.name) + ' down">&#9660;</button></span>');
+    h.push('<span class="grip" draggable="true" tabindex="0" role="button" data-drag-id="' + attr(project.id) +
+      '" title="drag to reorder (arrow keys work too)" aria-label="reorder ' + attr(project.name) + '">&#10303;</span>');
     h.push('<button class="tiny ghost" data-action="pin" data-id="' + attr(project.id) + '" data-pinned="' + attr(project.pinned ? 1 : 0) +
       '" title="' + (project.pinned ? "pinned: schedule and idle rule skip it" : "not pinned") + '" aria-pressed="' + (project.pinned ? "true" : "false") + '">' +
       (project.pinned ? "📌 pinned" : "📍 pin") + "</button>");
@@ -789,19 +796,112 @@ td.acts { white-space: nowrap; }
     });
   }
 
+  function placeProject(id, targetId, before) {
+    // Drop `id` right before/after `targetId` in the global manual order and
+    // leave every other project where it was, then send the whole sequence.
+    id = Number(id); targetId = Number(targetId);
+    if (!STATE || id === targetId) { return Promise.resolve(); }
+    var order = (STATE.projects || []).slice().sort(manualOrder).map(function (p) { return p.id; });
+    if (order.indexOf(id) < 0 || order.indexOf(targetId) < 0) { return Promise.resolve(); }
+    order.splice(order.indexOf(id), 1);
+    order.splice(order.indexOf(targetId) + (before ? 0 : 1), 0, id);
+    return api.post("/api/projects/order", { ids: order });
+  }
+
   function moveProject(id, delta) {
-    // Move the card past its visible neighbour without disturbing anyone else:
-    // take the global manual order, pull the project out and drop it right
-    // before/after that neighbour, then send the whole sequence to the server.
-    var visible = displayedProjects(STATE).filter(function (p) { return projectCardHtml(p) !== ""; });
+    // keyboard fallback: swap with the visible neighbour of the same group
+    // (active cards always sit above stopped ones, so crossing is a no-op)
+    var me = (STATE.projects || []).filter(function (p) { return String(p.id) === String(id); })[0];
+    if (!me) { return Promise.resolve(); }
+    var visible = displayedProjects(STATE).filter(function (p) {
+      return projectCardHtml(p) !== "" && isActiveProject(p) === isActiveProject(me);
+    });
     var at = visible.findIndex(function (p) { return String(p.id) === String(id); });
     var neighbour = visible[at + delta];
     if (at < 0 || !neighbour) { return Promise.resolve(); }
-    var order = (STATE.projects || []).slice().sort(manualOrder).map(function (p) { return p.id; });
-    order.splice(order.indexOf(Number(id)), 1);
-    var target = order.indexOf(neighbour.id) + (delta > 0 ? 1 : 0);
-    order.splice(target, 0, Number(id));
-    return api.post("/api/projects/order", { ids: order });
+    return placeProject(id, neighbour.id, delta < 0);
+  }
+
+  /* ------------------------------------------------- drag and drop (cards) */
+  var dragId = null;
+  var dropTarget = null;   // { card, before }
+
+  function clearDropMarks() {
+    qa(".card.drop-before, .card.drop-after").forEach(function (c) { c.classList.remove("drop-before", "drop-after"); });
+    dropTarget = null;
+  }
+
+  function dropSide(card, ev) {
+    // multi-column grid: left/right half decides; single column: top/bottom
+    var r = card.getBoundingClientRect();
+    var grid = q("#projects");
+    var stacked = grid && grid.getBoundingClientRect().width < r.width * 1.5;
+    grid.classList.toggle("stacked", !!stacked);
+    return stacked ? (ev.clientY < r.top + r.height / 2) : (ev.clientX < r.left + r.width / 2);
+  }
+
+  function wireDrag(grid) {
+    grid.addEventListener("dragstart", function (ev) {
+      var grip = ev.target.closest ? ev.target.closest(".grip") : null;
+      if (!grip) { ev.preventDefault(); return; }   // only the grip starts a drag (inputs keep text selection)
+      dragId = grip.getAttribute("data-drag-id");
+      var card = grip.closest(".card");
+      ev.dataTransfer.effectAllowed = "move";
+      try { ev.dataTransfer.setData("text/plain", dragId); } catch (e) { /* old engines */ }
+      if (card && ev.dataTransfer.setDragImage) {
+        var r = card.getBoundingClientRect();
+        ev.dataTransfer.setDragImage(card, ev.clientX - r.left, ev.clientY - r.top);
+      }
+      // class after the drag image is captured, so the ghost is not faded
+      window.setTimeout(function () { if (card) { card.classList.add("dragging"); } }, 0);
+    });
+    grid.addEventListener("dragover", function (ev) {
+      if (dragId === null) { return; }
+      var card = ev.target.closest ? ev.target.closest(".card") : null;
+      if (!card || card.getAttribute("data-project") === dragId) { clearDropMarks(); return; }
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = "move";
+      var before = dropSide(card, ev);
+      if (dropTarget && dropTarget.card === card && dropTarget.before === before) { return; }
+      clearDropMarks();
+      card.classList.add(before ? "drop-before" : "drop-after");
+      dropTarget = { card: card, before: before };
+    });
+    // dragleave is useless for this (Chromium fires it with relatedTarget=null
+    // on every child boundary): the mark is cleared when the pointer is seen
+    // over anything outside the grid instead
+    document.addEventListener("dragover", function (ev) {
+      if (dragId !== null && !grid.contains(ev.target)) { clearDropMarks(); }
+    });
+    grid.addEventListener("drop", function (ev) {
+      if (dragId === null) { return; }
+      ev.preventDefault();
+      var target = dropTarget;
+      var id = dragId;
+      endDrag();
+      if (!target) { return; }
+      placeProject(id, target.card.getAttribute("data-project"), target.before)
+        .then(function () { return refresh(); })
+        .catch(function (err) { toast(err && err.message ? err.message : String(err), "err"); });
+    });
+    grid.addEventListener("dragend", endDrag);
+    // keyboard: focus the grip, Arrow Up/Down moves the card
+    grid.addEventListener("keydown", function (ev) {
+      var grip = ev.target.closest ? ev.target.closest(".grip") : null;
+      if (!grip || (ev.key !== "ArrowUp" && ev.key !== "ArrowDown")) { return; }
+      ev.preventDefault();
+      var id = grip.getAttribute("data-drag-id");
+      moveProject(id, ev.key === "ArrowUp" ? -1 : 1).then(function () { return refresh(); }).then(function () {
+        var again = q('.grip[data-drag-id="' + id + '"]');
+        if (again) { again.focus(); }
+      }).catch(function (err) { toast(err && err.message ? err.message : String(err), "err"); });
+    });
+  }
+
+  function endDrag() {
+    qa(".card.dragging").forEach(function (c) { c.classList.remove("dragging"); });
+    clearDropMarks();
+    dragId = null;
   }
 
   function renderProjects(state) {
@@ -1056,12 +1156,6 @@ td.acts { white-space: nowrap; }
       saveCollapsed();
       applyCollapsed();
     },
-    "move-up": function (btn) {
-      return run(btn, function () { return moveProject(btn.getAttribute("data-id"), -1); }, "moved up");
-    },
-    "move-down": function (btn) {
-      return run(btn, function () { return moveProject(btn.getAttribute("data-id"), 1); }, "moved down");
-    },
     "pin": function (btn) {
       var id = btn.getAttribute("data-id");
       var next = btn.getAttribute("data-pinned") === "1" ? 0 : 1;
@@ -1253,6 +1347,8 @@ td.acts { white-space: nowrap; }
       renderProjects(STATE);
     }
   });
+
+  wireDrag(q("#projects"));
 
   q("#ports-projects-only").addEventListener("change", function (ev) {
     portsProjectsOnly = !!ev.target.checked;
