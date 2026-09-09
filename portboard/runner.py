@@ -171,6 +171,15 @@ def build_env(conn: sqlite3.Connection, project: Any, instance: Any) -> dict[str
     env["PORTBOARD_PROJECT"] = str(_field(project, "name", ""))
 
     prepend = _field(project, "path_prepend", None) or db.get_setting(conn, "node_path", "") or ""
+    if not prepend.strip():
+        # settings.node_path is filled by `portboard install`; when it is empty
+        # (fresh state dir, wiped settings) look for the nvm node now rather
+        # than launching `npm run dev` into a PATH where npm does not exist
+        from . import install
+        try:
+            prepend = install.detect_node_path() or ""
+        except Exception:
+            prepend = ""
     prepend = prepend.strip().rstrip(":")
     base_path = "/usr/local/bin:/usr/bin:/bin"
     env["PATH"] = f"{prepend}:{base_path}" if prepend else base_path

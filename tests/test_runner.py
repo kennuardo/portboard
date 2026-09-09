@@ -295,11 +295,24 @@ class TestBuildEnv(RunnerTestCase):
                          "/opt/tools/bin:/usr/local/bin:/usr/bin:/bin")
 
     def test_path_without_any_prepend(self):
+        from unittest import mock
+        from portboard import install
         db.set_setting(self.conn, "node_path", "")
         project = self.add_project()
         instance = self.add_instance(project)
-        self.assertEqual(runner.build_env(self.conn, project, instance)["PATH"],
-                         "/usr/local/bin:/usr/bin:/bin")
+        with mock.patch.object(install, "detect_node_path", return_value=None):
+            self.assertEqual(runner.build_env(self.conn, project, instance)["PATH"],
+                             "/usr/local/bin:/usr/bin:/bin")
+
+    def test_empty_node_path_setting_falls_back_to_detection(self):
+        from unittest import mock
+        from portboard import install
+        db.set_setting(self.conn, "node_path", "")
+        project = self.add_project()
+        instance = self.add_instance(project)
+        with mock.patch.object(install, "detect_node_path", return_value="/home/u/.nvm/versions/node/v20/bin"):
+            self.assertEqual(runner.build_env(self.conn, project, instance)["PATH"],
+                             "/home/u/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin")
 
     def test_env_json_is_merged_last_and_can_override(self):
         project = self.add_project(env_json='{"PORT": "9999", "API_URL": "http://x", "N": 3}')
