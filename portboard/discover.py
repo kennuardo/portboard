@@ -211,6 +211,16 @@ def _candidates(
         if port:
             out.append((port, "high", f"{filename} service {service} publishes {port}"))
 
+    for rel in ("src/main/resources/application.properties", "src/main/resources/application.yml",
+                "config/application.properties"):
+        path = os.path.join(root, rel)
+        if os.path.isfile(path):
+            match = re.search(r"^\s*server\.port\s*[=:]\s*([0-9]{2,5})\b", _read(path), re.M) or \
+                re.search(r"^server:\s*\n(?:[ \t]+.*\n)*?[ \t]+port:\s*([0-9]{2,5})\b", _read(path), re.M)
+            if match:
+                out.append((int(match.group(1)), "medium", f"{rel} server.port={match.group(1)}"))
+                break
+
     env_path = os.path.join(root, ".env")
     if os.path.isfile(env_path):
         for line in _read(env_path).splitlines():
@@ -307,6 +317,7 @@ def _base(root: str) -> dict[str, Any]:
 MANIFEST_FILES = (
     "package.json", "pyproject.toml", "requirements.txt", "setup.py", "setup.cfg",
     "go.mod", "Cargo.toml", "composer.json", "Gemfile", "mix.exs", "Procfile",
+    "pom.xml", "build.gradle", "build.gradle.kts",
 )
 
 
@@ -381,6 +392,12 @@ def suggest(path: str) -> dict | None:
             result["port_mode"] = "env"
             result["start_cmd"] = "./run.sh"
             evidence.append("run.sh at root")
+            stack_conf = "medium"
+        elif os.path.isfile(os.path.join(root, "pom.xml")) and os.path.isfile(os.path.join(root, "mvnw")):
+            result["kind"] = "transient"
+            result["port_mode"] = "env"   # Spring Boot reads SERVER_PORT
+            result["start_cmd"] = "./mvnw spring-boot:run"
+            evidence.append("pom.xml + mvnw (Spring Boot)")
             stack_conf = "medium"
         else:
             makefile = os.path.join(root, "Makefile")
@@ -465,8 +482,145 @@ def scan(root: str, max_depth: int = 1) -> list[dict]:
             if found is not None:
                 results.append(found)
                 continue
+            group = suggest_group(entry.path)
+            if group is not None:
+                results.append(group)
+                continue
             if depth < max_depth:
                 walk(entry.path, depth + 1)
 
     walk(base, 1)
     return results
+
+
+# --------------------------------------------------------------------------
+# groups: one directory holding several sibling sub-projects (multi-repo apps)
+# --------------------------------------------------------------------------
+
+#: name tokens that make a child the one a human opens (higher wins); negative
+#: tokens push backends/databases away from the primary slot
+PRIMARY_TOKENS: dict[str, int] = {
+    "frontend": 6, "web": 5, "ui": 4, "admin": 4, "client": 3, "app": 2,
+    "customer": 1, "portal": 2, "dashboard": 3,
+    "api": -3, "server": -3, "backend": -3, "service": -2, "worker": -4,
+    "db": -6, "database": -6, "mariadb": -6, "mysql": -6, "postgres": -6,
+    "redis": -6, "mail": -5, "mailpit": -5, "tools": -8,
+}
+#: at least this many project-like children before a directory is a group
+GROUP_MIN_CHILDREN = 2
+
+
+def primary_score(name: str, base_port: int | None = None, kind: str | None = None) -> int:
+    """How much *name* looks like the frontend of a group (pure heuristic)."""
+    score = 0
+    for token in re.split(r"[^a-z0-9]+", (name or "").lower()):
+        if token:
+            score += PRIMARY_TOKENS.get(token, 0)
+    if kind == "none":
+        score -= 1  # cannot be started by us: weaker candidate for "the" URL
+    if base_port:
+        score += 1  # something with a known port beats something without
+    return score
+
+
+def pick_primary(children: list[dict]) -> dict | None:
+    """The child a human would open: best primary_score, ties -> lowest port, then name."""
+    if not children:
+        return None
+
+    def key(child: dict):
+        port = child.get("base_port")
+        return (
+            -primary_score(child.get("name") or "", port, child.get("kind")),
+            port if port else 99_999,
+            child.get("name") or "",
+        )
+
+    return sorted(children, key=key)[0]
+
+
+def _group_child_dirs(root: str) -> list[str]:
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return []
+    return [
+        e.path for e in entries
+        if e.is_dir(follow_symlinks=False) and not e.name.startswith(".") and e.name not in SKIP_DIRS
+    ]
+
+
+def _is_group_root_candidate(root: str) -> bool:
+    """A plain directory: exists, is not itself a git repo or a project."""
+    if not os.path.isdir(root):
+        return False
+    if has_git(root):
+        return False
+    if os.path.realpath(root) in ("/", os.path.expanduser("~")):
+        return False
+    return suggest(root) is None
+
+
+def suggest_group(path: str) -> dict | None:
+    """A directory holding >= 2 sibling git repositories with a known stack.
+
+    Returns a project suggestion with ``kind='group'`` plus ``children`` (the
+    ``suggest()`` result of every project-like child, names prefixed with the
+    group name) and ``primary`` (the child name a human would open), or None.
+    """
+    root = os.path.realpath(os.path.expanduser(str(path)))
+    if not _is_group_root_candidate(root):
+        return None
+    group_name = _name_for(root)
+    children: list[dict] = []
+    for child_dir in _group_child_dirs(root):
+        if not has_git(child_dir):
+            continue
+        child = suggest(child_dir)
+        if child is None:
+            continue
+        child["name"] = f"{group_name}-{child['name']}"
+        children.append(child)
+    if len(children) < GROUP_MIN_CHILDREN:
+        return None
+    primary = pick_primary(children)
+    result = _base(root)
+    result.update({
+        "name": group_name,
+        "kind": "group",
+        "port_mode": "none",
+        "start_cmd": None,
+        "base_port": None,
+        "children": children,
+        "primary": primary["name"] if primary else None,
+        "confidence": "medium",
+        "evidence": [
+            f"{len(children)} sub-projects: " + ", ".join(c["name"] for c in children),
+            f"primary (frontend) guess: {primary['name']}" if primary else "no primary guess",
+            "no .git at the group root",
+        ],
+    })
+    return result
+
+
+def group_of(path: str, projects_root: str | os.PathLike[str] | None = None) -> dict | None:
+    """The group suggestion for the directory holding *path*, if it is one.
+
+    ``path`` is a repository (or a directory inside a would-be group); its
+    parent must not be the projects root itself (that would make every project
+    on the machine one group).
+    """
+    root = os.path.realpath(os.path.expanduser(str(path)))
+    if projects_root is None:
+        from . import config
+
+        projects_root = config.PROJECTS_ROOT
+    projects_root = os.path.realpath(os.path.expanduser(str(projects_root)))
+    if root == projects_root:
+        return None
+    if not has_git(root) and _is_group_root_candidate(root):
+        return suggest_group(root)  # asked about the group directory itself
+    parent = os.path.dirname(root)
+    if parent in (root, projects_root, "/"):
+        return None
+    return suggest_group(parent)

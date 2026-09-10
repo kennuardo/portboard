@@ -23,10 +23,12 @@ CREATE TABLE IF NOT EXISTS projects (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   name         TEXT NOT NULL UNIQUE,
   path         TEXT NOT NULL UNIQUE,          -- main checkout, absolute, no trailing slash
-  kind         TEXT NOT NULL DEFAULT 'transient',  -- transient | unit | compose | none
+  kind         TEXT NOT NULL DEFAULT 'transient',  -- transient | unit | compose | container | group | none
   start_cmd    TEXT,                          -- transient: shell command ({port} placeholder allowed)
                                               -- unit: existing systemd --user unit name (e.g. sheron-dev.service)
                                               -- compose: optional override of "docker compose up -d"
+                                              -- container: docker container name (worktrees: <name>-<label>)
+                                              -- group: unused
   stop_cmd     TEXT,                          -- optional override for stop
   port_mode    TEXT NOT NULL DEFAULT 'env',   -- env (PORT/NUXT_PORT/NITRO_PORT injected) | arg ({port} in start_cmd)
                                               -- fixed (unit/compose decide themselves) | none (no port)
@@ -42,6 +44,8 @@ CREATE TABLE IF NOT EXISTS projects (
   source       TEXT NOT NULL DEFAULT 'cli',   -- cli | gui | mcp | hook | discover | adopted
   notes        TEXT,
   sort_order   INTEGER NOT NULL DEFAULT 0, -- manual position in the GUI list (lower first, ties by name)
+  parent_id    INTEGER REFERENCES projects(id) ON DELETE CASCADE,  -- set on the children of a kind='group' project
+  primary_child INTEGER,                      -- group: id of the child whose port/url/state the group shows (NULL = heuristic)
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL
 );
@@ -139,6 +143,8 @@ def connect() -> sqlite3.Connection:
 # NOT EXISTS does not touch an existing table, so they are added here
 _ADDED_COLUMNS = (
     ("projects", "sort_order", "INTEGER NOT NULL DEFAULT 0"),
+    ("projects", "parent_id", "INTEGER REFERENCES projects(id) ON DELETE CASCADE"),
+    ("projects", "primary_child", "INTEGER"),
 )
 
 

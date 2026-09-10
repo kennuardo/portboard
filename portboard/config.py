@@ -50,7 +50,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
 }
 
 # Kinds of projects and how the runner treats them.
-KINDS = ("transient", "unit", "compose", "none")
+# ``group``: a directory of sibling sub-projects (children carry parent_id); its
+# main instance mirrors the primary child. ``container``: an existing docker
+# container named in start_cmd (docker start/stop), e.g. hand-made dev stacks.
+KINDS = ("transient", "unit", "compose", "container", "group", "none")
 PORT_MODES = ("env", "arg", "fixed", "none")
 STATES = ("stopped", "starting", "running", "failed", "unknown")
 

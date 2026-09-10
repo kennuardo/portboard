@@ -41,6 +41,7 @@ class Resolved:
     is_worktree: bool = False
     slug: str | None = None
     path: str = ""
+    group: dict | None = None   # the kind='group' parent when project is a child of one
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +51,7 @@ class Resolved:
             "is_worktree": self.is_worktree,
             "slug": self.slug,
             "path": self.path,
+            "group": self.group,
         }
 
 
@@ -283,24 +285,189 @@ def _project_row(conn: sqlite3.Connection, project_id: int) -> dict | None:
 
 
 def get_project(conn: sqlite3.Connection, ref: int | str) -> dict | None:
-    """Look a project up by id (int or digit string) or by name."""
+    """Look a project up by id (int or digit string) or by name (decorated, see _decorate)."""
     if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
-        return _project_row(conn, int(ref))
-    return db.row(conn.execute("SELECT * FROM projects WHERE name = ?", (str(ref),)).fetchone())
+        row = _project_row(conn, int(ref))
+    else:
+        row = db.row(conn.execute("SELECT * FROM projects WHERE name = ?", (str(ref),)).fetchone())
+    if row is None:
+        return None
+    return _decorate(conn, [row])[0]
 
 
 def list_projects(conn: sqlite3.Connection, with_instances: bool = False) -> list[dict]:
-    projects = db.rows(conn.execute("SELECT * FROM projects ORDER BY sort_order, name"))
+    projects = _decorate(conn, db.rows(conn.execute("SELECT * FROM projects ORDER BY sort_order, name")))
     if not with_instances:
         return projects
     by_id = {p["id"]: p for p in projects}
     for project in projects:
         project["instances"] = []
-    for row in conn.execute("SELECT * FROM instances ORDER BY slot, id"):
-        project = by_id.get(row["project_id"])
-        if project is not None:
+    # children first: a group's main instance mirrors its primary child's row
+    ordered = sorted(projects, key=lambda p: p.get("kind") == "group")
+    for project in ordered:
+        for row in conn.execute("SELECT * FROM instances WHERE project_id = ? ORDER BY slot, id",
+                                (project["id"],)):
             project["instances"].append(_instance_view(conn, dict(row), project))
     return projects
+
+
+# --------------------------------------------------------------------------
+# groups (kind='group': one directory of sibling sub-projects)
+# --------------------------------------------------------------------------
+
+
+def _decorate(conn: sqlite3.Connection, projects: list[dict]) -> list[dict]:
+    """Add the computed group fields every consumer expects.
+
+    * every project: ``parent`` (parent name or None)
+    * kind='group': ``children`` (child ids, display order), ``child_names``,
+      ``primary_child_id`` (explicit ``primary_child`` when it is still a child,
+      else the discover heuristic) and ``primary`` (its name).
+    """
+    if not projects:
+        return projects
+    all_rows = db.rows(conn.execute(
+        "SELECT id, name, parent_id, base_port, kind, sort_order FROM projects ORDER BY sort_order, name"))
+    by_id = {r["id"]: r for r in all_rows}
+    children_of: dict[int, list[dict]] = {}
+    for r in all_rows:
+        if r["parent_id"] is not None:
+            children_of.setdefault(int(r["parent_id"]), []).append(r)
+    for project in projects:
+        parent = by_id.get(project.get("parent_id")) if project.get("parent_id") is not None else None
+        project["parent"] = parent["name"] if parent else None
+        if project.get("kind") != "group":
+            continue
+        kids = children_of.get(project["id"], [])
+        project["children"] = [k["id"] for k in kids]
+        project["child_names"] = [k["name"] for k in kids]
+        primary = _pick_primary_row(project, kids)
+        project["primary_child_id"] = primary["id"] if primary else None
+        project["primary"] = primary["name"] if primary else None
+    return projects
+
+
+def _pick_primary_row(group: dict, children: list[dict]) -> dict | None:
+    wanted = group.get("primary_child")
+    if wanted is not None:
+        for child in children:
+            if int(child["id"]) == int(wanted):
+                return child
+    from . import discover
+
+    return discover.pick_primary(children)
+
+
+def group_children(conn: sqlite3.Connection, group_id: int) -> list[dict]:
+    """Child projects of a group in display order (sort_order, name)."""
+    rows = db.rows(conn.execute(
+        "SELECT * FROM projects WHERE parent_id = ? ORDER BY sort_order, name", (int(group_id),)))
+    return _decorate(conn, rows)
+
+
+def primary_child(conn: sqlite3.Connection, group: dict) -> dict | None:
+    """The child whose port/url/state the group shows (explicit or heuristic)."""
+    children = group_children(conn, group["id"])
+    return _pick_primary_row(group, children)
+
+
+def group_start_order(conn: sqlite3.Connection, group: dict) -> list[dict]:
+    """Children in start order: display order with the primary moved last."""
+    children = group_children(conn, group["id"])
+    primary = _pick_primary_row(group, children)
+    if primary is None:
+        return children
+    return [c for c in children if c["id"] != primary["id"]] + [primary]
+
+
+def _child_main_views(conn: sqlite3.Connection, group: dict) -> list[dict]:
+    views = []
+    for child in group_children(conn, group["id"]):
+        main = _main_instance(conn, child["id"])
+        if main is not None:
+            views.append(_instance_view(conn, main, child))
+    return views
+
+
+def _validate_parent(conn: sqlite3.Connection, parent_id: Any, child_id: int | None = None) -> int | None:
+    if parent_id is None:
+        return None
+    parent = _project_row(conn, int(parent_id))
+    if parent is None:
+        raise RegistryError(f"no project with id {parent_id} to use as a group")
+    if parent.get("kind") != "group":
+        raise RegistryError(f"project {parent['name']!r} is not a group (kind {parent['kind']!r})")
+    if parent.get("parent_id") is not None:
+        raise RegistryError("nested groups are not supported")
+    if child_id is not None and int(child_id) == parent["id"]:
+        raise RegistryError("a project cannot be its own parent")
+    return parent["id"]
+
+
+def add_group(conn: sqlite3.Connection, suggestion: dict, source: str = "cli",
+              allow_busy: bool = True) -> dict:
+    """Register a discover.suggest_group() result: the group and every child.
+
+    A child whose path is already registered is re-parented (its own config is
+    kept); the primary is taken from ``suggestion["primary"]`` (a child name).
+    Returns the decorated group project.
+    """
+    data = dict(suggestion or {})
+    children = list(data.pop("children", None) or [])
+    primary_name = data.pop("primary", None)
+    for key in ("confidence", "evidence"):
+        data.pop(key, None)
+    path = data.pop("path", None)
+    if not path:
+        raise RegistryError("group suggestion without a path")
+    name = data.pop("name", None)
+    path = normalize_path(path)
+    group = db.row(conn.execute("SELECT * FROM projects WHERE path = ?", (path,)).fetchone())
+    if group is None:
+        data.pop("kind", None)
+        data.pop("port_mode", None)
+        data.pop("base_port", None)
+        data.pop("start_cmd", None)
+        group = add_project(conn, path, name=name, kind="group", port_mode="none",
+                            source=source, **data)
+    elif group.get("kind") != "group":
+        raise RegistryError(f"{path} is already registered as {group['name']!r} (kind {group['kind']!r})")
+
+    primary_id = None
+    for child in children:
+        child = dict(child)
+        for key in ("confidence", "evidence", "children", "primary"):
+            child.pop(key, None)
+        cpath = child.pop("path", None)
+        if not cpath:
+            continue
+        cpath = normalize_path(cpath)
+        cname = child.pop("name", None)
+        existing = db.row(conn.execute("SELECT * FROM projects WHERE path = ?", (cpath,)).fetchone())
+        if existing is not None:
+            if existing.get("parent_id") not in (None, group["id"]):
+                raise RegistryError(f"{existing['name']!r} already belongs to another group")
+            if existing.get("parent_id") != group["id"]:
+                update_project(conn, existing["id"], parent_id=group["id"])
+            row = existing
+        else:
+            try:
+                row = add_project(
+                    conn, cpath, name=cname,
+                    kind=child.pop("kind", "transient"),
+                    start_cmd=child.pop("start_cmd", None),
+                    base_port=child.pop("base_port", None),
+                    port_mode=child.pop("port_mode", "env"),
+                    source=source, allow_busy=allow_busy, parent_id=group["id"], **child,
+                )
+            except RegistryError as exc:
+                log.warning("group %s: child %s not registered: %s", group["name"], cpath, exc)
+                continue
+        if primary_name and (cname == primary_name or row.get("name") == primary_name):
+            primary_id = row["id"]
+    if primary_id is not None and group.get("primary_child") != primary_id:
+        update_project(conn, group["id"], primary_child=primary_id)
+    return get_project(conn, group["id"]) or group
 
 
 def add_project(
@@ -313,12 +480,15 @@ def add_project(
     port_mode: str = "env",
     source: str = "cli",
     allow_busy: bool = False,
+    parent_id: int | None = None,
     **fields: Any,
 ) -> dict:
     """Register a project and its 'main' instance.
 
     allow_busy=True keeps an explicit base_port even when something already
     listens on it (typically the project's own dev server); see allocate_base_port.
+    parent_id makes the project a child of a kind='group' project; without a
+    name it is called ``<group>-<basename>``. kind='group' never has a port.
     """
     if kind not in config.KINDS:
         raise RegistryError(f"unknown kind {kind!r} (expected one of {', '.join(config.KINDS)})")
@@ -327,6 +497,14 @@ def add_project(
             f"unknown port_mode {port_mode!r} (expected one of {', '.join(config.PORT_MODES)})"
         )
     path = normalize_path(path)
+    parent_id = _validate_parent(conn, fields.pop("parent_id", parent_id))
+    if parent_id is not None and kind == "group":
+        raise RegistryError("nested groups are not supported")
+    if kind == "group":
+        port_mode, base_port, start_cmd = "none", None, None
+    if not name and parent_id is not None:
+        parent = _project_row(conn, parent_id) or {}
+        name = f"{parent.get('name', 'group')}-{derive_name(path)}"
     name = (name or derive_name(path)).strip()
     if not name:
         raise RegistryError("project name is empty")
@@ -351,6 +529,7 @@ def add_project(
         "base_port": base_port,
         "slots": db.get_int_setting(conn, "slots", 9),
         "source": source,
+        "parent_id": parent_id,
         "created_at": ts,
         "updated_at": ts,
     }
@@ -382,6 +561,18 @@ def update_project(conn: sqlite3.Connection, project_id: int, **fields: Any) -> 
         raise RegistryError(f"unknown port_mode {fields['port_mode']!r}")
     if fields.get("path"):
         fields["path"] = normalize_path(fields["path"])
+    if "parent_id" in fields:
+        fields["parent_id"] = _validate_parent(conn, fields["parent_id"], child_id=project["id"])
+        if fields["parent_id"] is not None and fields.get("kind", project["kind"]) == "group":
+            raise RegistryError("nested groups are not supported")
+    if "primary_child" in fields and fields["primary_child"] is not None:
+        wanted = fields["primary_child"]
+        child = get_project(conn, wanted) if not isinstance(wanted, int) else _project_row(conn, wanted)
+        if child is None or child.get("parent_id") != project["id"]:
+            raise RegistryError(f"{wanted!r} is not a child of group {project['name']!r}")
+        fields["primary_child"] = child["id"]
+    if fields.get("kind") == "group":
+        fields["port_mode"], fields["base_port"] = "none", None
 
     main = _main_instance(conn, project["id"])
     new_port = fields.get("base_port", project["base_port"])
@@ -418,6 +609,8 @@ def delete_project(conn: sqlite3.Connection, project_id: int) -> None:
     project = _project_row(conn, int(project_id))
     if project is None:
         raise RegistryError(f"no project with id {project_id}")
+    for child in db.rows(conn.execute("SELECT id FROM projects WHERE parent_id = ?", (project["id"],))):
+        delete_project(conn, child["id"])
     conn.execute("DELETE FROM instances WHERE project_id = ?", (project["id"],))
     conn.execute("DELETE FROM projects WHERE id = ?", (project["id"],))
     conn.execute("UPDATE observed SET project_id = NULL, instance_id = NULL WHERE project_id = ?",
@@ -432,8 +625,8 @@ def delete_project(conn: sqlite3.Connection, project_id: int) -> None:
 
 def _instance_view(conn: sqlite3.Connection, row: dict, project: dict | None = None) -> dict:
     """Row plus the computed fields the API and GUI expect."""
-    if project is None:
-        project = _project_row(conn, row["project_id"]) or {}
+    if project is None or "parent" not in project:
+        project = get_project(conn, int(row["project_id"])) or {}
     view = dict(row)
     view["project"] = project.get("name")
     view["kind"] = project.get("kind")
@@ -441,7 +634,33 @@ def _instance_view(conn: sqlite3.Connection, row: dict, project: dict | None = N
     view["open_path"] = project.get("open_path", "/")
     view["worktree"] = bool(row.get("slot"))
     view["url"] = url_for(project, row)
+    view["parent"] = project.get("parent")
+    if project.get("kind") == "group" and not row.get("slot"):
+        _mirror_primary(conn, view, project)
     return view
+
+
+_MIRRORED = ("state", "port", "actual_port", "url", "pid", "started_at", "stopped_at",
+             "stopped_by", "mem_bytes", "cpu_ns", "idle_since", "unit", "managed")
+
+
+def _mirror_primary(conn: sqlite3.Connection, view: dict, group: dict) -> None:
+    """A group's main instance shows its primary child's main instance, plus
+    ``services`` (every child's main instance, display order) for the GUI."""
+    if "primary_child_id" not in group:
+        group = _decorate(conn, [dict(group)])[0]
+    services = _child_main_views(conn, group)
+    view["services"] = services
+    view["primary"] = group.get("primary")
+    primary = next((s for s in services if s.get("project_id") == group.get("primary_child_id")), None)
+    if primary is None:
+        return
+    for key in _MIRRORED:
+        view[key] = primary.get(key)
+    view["primary_instance_id"] = primary.get("id")
+    running = [s for s in services if s.get("state") == "running"]
+    view["services_running"] = len(running)
+    view["services_total"] = len(services)
 
 
 def _main_instance(conn: sqlite3.Connection, project_id: int) -> dict | None:
@@ -650,6 +869,7 @@ def resolve_path(conn: sqlite3.Connection, path: str) -> Resolved:
     if real == wt_root or real.startswith(wt_root + os.sep):
         rest = real[len(wt_root):].strip(os.sep)
         slug = rest.split(os.sep)[0] if rest else None
+    group = get_project(conn, int(best["parent_id"])) if best.get("parent_id") is not None else None
     if slug:
         row = conn.execute(
             "SELECT * FROM instances WHERE project_id = ? AND (label = ? OR path = ?)",
@@ -657,7 +877,7 @@ def resolve_path(conn: sqlite3.Connection, path: str) -> Resolved:
         ).fetchone()
         instance = _instance_view(conn, dict(row), best) if row else None
         return Resolved(project=best, instance=instance, label=slug, is_worktree=True,
-                        slug=slug, path=real)
+                        slug=slug, path=real, group=group)
     main = _main_instance(conn, best["id"])
     return Resolved(
         project=best,
@@ -666,6 +886,7 @@ def resolve_path(conn: sqlite3.Connection, path: str) -> Resolved:
         is_worktree=False,
         slug=None,
         path=real,
+        group=group,
     )
 
 
@@ -733,14 +954,18 @@ def state_snapshot(conn: sqlite3.Connection) -> dict:
     }
 
 
-_EXPORT_SKIP_PROJECT = {"id", "created_at", "updated_at"}
+_EXPORT_SKIP_PROJECT = {"id", "created_at", "updated_at", "parent_id", "primary_child",
+                        "children", "child_names", "primary_child_id", "instances"}
 _EXPORT_INSTANCE_KEEP = ("label", "slot", "path", "branch", "port", "unit", "managed")
 
 
 def export_json(conn: sqlite3.Connection) -> dict:
     projects = []
-    for project in list_projects(conn):
+    # groups before their children so import can resolve ``parent`` by name
+    for project in sorted(list_projects(conn), key=lambda p: p.get("parent_id") is not None):
         item = {k: v for k, v in project.items() if k not in _EXPORT_SKIP_PROJECT}
+        item["parent"] = project.get("parent")            # group name or None
+        item["primary"] = project.get("primary")          # groups: primary child name
         item["instances"] = [
             {k: row[k] for k in _EXPORT_INSTANCE_KEEP}
             for row in db.rows(
@@ -756,6 +981,7 @@ def export_json(conn: sqlite3.Connection) -> dict:
 def import_json(conn: sqlite3.Connection, data: dict, replace: bool = False) -> dict:
     """Recreate projects and their worktree instances from export_json output."""
     summary = {"projects_added": 0, "projects_updated": 0, "instances_added": 0, "errors": []}
+    pending_primary: list[tuple[int, str]] = []
     if replace:
         for project in list_projects(conn):
             delete_project(conn, project["id"])
@@ -767,6 +993,16 @@ def import_json(conn: sqlite3.Connection, data: dict, replace: bool = False) -> 
             summary["errors"].append("project without a path skipped")
             continue
         name = item.pop("name", None)
+        parent_name = item.pop("parent", None)
+        primary_name = item.pop("primary", None)
+        for key in ("children", "child_names", "primary_child_id"):
+            item.pop(key, None)
+        if parent_name:
+            parent = get_project(conn, parent_name)
+            if parent is None:
+                summary["errors"].append(f"{name or path}: group {parent_name!r} not found")
+                continue
+            item["parent_id"] = parent["id"]
         existing = get_project(conn, name) if name else None
         if existing is None:
             existing = db.row(
@@ -797,6 +1033,8 @@ def import_json(conn: sqlite3.Connection, data: dict, replace: bool = False) -> 
         except RegistryError as exc:
             summary["errors"].append(f"{name or path}: {exc}")
             continue
+        if primary_name and project.get("kind") == "group":
+            pending_primary.append((project["id"], primary_name))
         for inst in instances:
             if int(inst.get("slot") or 0) == 0:
                 continue
@@ -812,4 +1050,9 @@ def import_json(conn: sqlite3.Connection, data: dict, replace: bool = False) -> 
                 summary["instances_added"] += 1
             except (RegistryError, KeyError) as exc:
                 summary["errors"].append(f"{project['name']}/{inst.get('label')}: {exc}")
+    for group_id, primary_name in pending_primary:
+        try:
+            update_project(conn, group_id, primary_child=primary_name)
+        except RegistryError as exc:
+            summary["errors"].append(f"primary of group {group_id}: {exc}")
     return summary
