@@ -286,6 +286,33 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual((inst["managed"], inst["unit"]), (0, "rma-admin"))
         self.assertEqual(self.observed(3100)["instance_id"], 3)
 
+    def test_root_host_network_container_matches_by_assigned_port(self):
+        # java inside a --network host container runs as root: ss prints no pid
+        # and docker publishes no port, so only the assigned port can tell
+        self.add_container_project(2, "rma-server-side", "rma-api", 8080)
+        self.add_instance(3, "main", 0, str(self.tmp / "rma-server-side"), 8080, project_id=2)
+        self.containers = [container("rma-api", network="host", pid=700)]
+        self.listeners = [listener(8080, pid=None, comm=None), listener(8083, pid=None, comm=None)]
+
+        summary = self.run_reconcile()
+
+        self.assertEqual(summary["matched"], 1)
+        inst = self.instance(3)
+        self.assertEqual((inst["state"], inst["actual_port"], inst["unit"]), ("running", 8080, "rma-api"))
+        self.assertEqual(self.observed(8080)["container"], "rma-api")
+        self.assertIsNone(self.observed(8083)["instance_id"])  # a stranger stays unknown
+
+    def test_pidless_listener_needs_a_running_container(self):
+        self.add_container_project(2, "rma-server-side", "rma-api", 8080)
+        self.add_instance(3, "main", 0, str(self.tmp / "rma-server-side"), 8080, project_id=2)
+        self.containers = []  # rma-api is not running: 8080 belongs to something else
+        self.listeners = [listener(8080, pid=None, comm=None)]
+
+        summary = self.run_reconcile()
+
+        self.assertEqual(summary["matched"], 0)
+        self.assertEqual(self.instance(3)["state"], "stopped")
+
     def test_hand_started_container_matches_a_worktree_by_suffix(self):
         self.add_container_project(2, "rma-admin-app", "rma-admin", 3100)
         self.add_instance(3, "main", 0, str(self.tmp / "rma-admin-app"), 3100, project_id=2)

@@ -122,6 +122,10 @@ class _Registry:
         )
         self.by_unit: dict[str, dict] = {}
         self.by_cid: dict[str, dict] = {}   # container id remembered from an earlier full reconcile
+        # port -> (container name, instance) for kind='container' instances: a
+        # --network host container runs as root, so ss shows no pid and docker
+        # publishes no port; the assigned port is the only handle we have
+        self.container_by_port: dict[int, tuple[str, dict]] = {}
         for inst in self.instances:
             if inst["unit"]:
                 self.by_unit.setdefault(inst["unit"], inst)
@@ -132,6 +136,8 @@ class _Registry:
                 name = _container_name(project, inst)
                 if name:
                     self.by_unit.setdefault(name, inst)
+                    if inst["port"]:
+                        self.container_by_port[int(inst["port"])] = (name, inst)
             try:
                 cid = json.loads(inst.get("extra_json") or "{}").get("container_id")
             except (TypeError, ValueError):
@@ -290,9 +296,19 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
     reserved_seen: dict[int, str] = {}
     unknown = 0
 
+    running_containers = {c.name for c in machine.containers
+                          if str(getattr(c, "state", "")).lower() == "running"}
     for listener in machine.listeners:
         seen = _describe(machine, listener)
         inst, project, label, path = _match(reg, seen)
+        if inst is None and seen["pid"] is None and listener.port in reg.container_by_port:
+            name, candidate = reg.container_by_port[listener.port]
+            if name in running_containers:
+                inst = candidate
+                project = reg.project_by_id.get(inst["project_id"])
+                label, path = inst["label"], inst["path"]
+                seen["container"] = name
+                seen["_in_container"] = True
         row = {k: v for k, v in seen.items() if not k.startswith("_")}
         row["project_id"] = project["id"] if project else None
         row["instance_id"] = inst["id"] if inst else None

@@ -347,9 +347,13 @@ def wait_for_listen(conn: sqlite3.Connection, project: Any, instance: Any,
                     host_ports.add(int(pair[0]))
                 except (TypeError, ValueError, IndexError):
                     continue
+            # collect every listener of the container this tick and prefer the
+            # assigned port (mailpit publishes 1025 and 8025: 8025 is the one)
+            hits: list[dict[str, Any]] = []
             for listener in listeners:
                 port = getattr(listener, "port", None)
                 pid = getattr(listener, "pid", None)
+                hit = False
                 if pid and cid:
                     try:
                         info = sysinfo.proc_info(pid)
@@ -359,13 +363,17 @@ def wait_for_listen(conn: sqlite3.Connection, project: Any, instance: Any,
                     # the pid inside a --network host container reports the
                     # container's cgroup, usually the short id
                     if seen_cid and (cid.startswith(seen_cid) or seen_cid.startswith(cid)):
-                        return {"port": port, "pid": pid}
+                        hit = True
                 if pid and cont_pid and pid == cont_pid:
-                    return {"port": port, "pid": pid}
+                    hit = True
                 if port and port in host_ports:
-                    return {"port": port, "pid": pid}
+                    hit = True
                 if want_port and port == want_port:
-                    return {"port": port, "pid": pid}
+                    hit = True
+                if hit:
+                    hits.append({"port": port, "pid": pid})
+            if hits:
+                return next((h for h in hits if want_port and h["port"] == want_port), hits[0])
         else:
             for listener in listeners:
                 if want_port and getattr(listener, "port", None) == want_port:
