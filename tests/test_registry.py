@@ -212,6 +212,20 @@ class TestInstances(RegistryTestCase):
             <= db.get_int_setting(self.conn, "pool_end")
         )
 
+    def test_sync_worktrees_creates_rows_for_dirs_on_disk_only_once(self):
+        root = self.make_dir("wtsync")
+        project = registry.add_project(self.conn, root, kind="transient", base_port=free_port(self.conn))
+        self.make_dir("wtsync", ".claude", "worktrees", "b-slug")
+        self.make_dir("wtsync", ".claude", "worktrees", "a-slug")
+        self.make_dir("wtsync", ".claude", "worktrees", ".hidden")
+
+        created = registry.sync_worktrees(self.conn)
+        self.assertEqual([i["label"] for i in created], ["a-slug", "b-slug"])
+        self.assertEqual([i["slot"] for i in created], [1, 2])
+        self.assertEqual(registry.sync_worktrees(self.conn), [])
+        labels = [i["label"] for i in registry.list_instances(self.conn, project_id=project["id"])]
+        self.assertEqual(labels, ["main", "a-slug", "b-slug"])
+
     def test_ensure_instance_rejects_a_foreign_path(self):
         with self.assertRaises(registry.RegistryError):
             registry.ensure_instance(self.conn, self.project["id"], self.make_dir("outside"))

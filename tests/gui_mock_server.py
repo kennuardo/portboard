@@ -325,10 +325,16 @@ INSTANCES += [
     _rma_instance(9, 8, 3101),
     _rma_instance(10, 9, 3100, unit="portboard-rma-admin-app-main.service"),
     _rma_instance(11, 4, None, unit=None),          # the group's mirror instance
-    _rma_instance(12, 9, 3102, label="csv-attributes", slot=1,
-                  path="/mnt/hyper/Projects/rma/admin-app/.claude/worktrees/csv-attributes",
-                  branch="worktree-csv-attributes",
-                  unit="portboard-rma-admin-app-csv-attributes.service"),
+    # the UI worktree the user actually works in: a full row on the group card
+    _rma_instance(12, 9, 3103, label="expert-request", slot=3, state="running",
+                  path="/mnt/hyper/Projects/rma/admin-app/.claude/worktrees/expert-request",
+                  branch="worktree-expert-request",
+                  unit="portboard-rma-admin-app-expert-request.service"),
+    # the same worktree of a backing service: folded into the info block
+    _rma_instance(13, 7, 8083, label="expert-request", slot=3, state="running",
+                  path="/mnt/hyper/Projects/rma/server-side/.claude/worktrees/expert-request",
+                  branch="worktree-expert-request",
+                  unit="portboard-rma-server-side-expert-request.service"),
 ]
 
 OBSERVED: list[dict] = [
@@ -355,6 +361,22 @@ OBSERVED: list[dict] = [
         "unit": "portboard-rma-server-side-main.service", "container": None,
         "compose_project": None, "compose_workdir": None,
         "project_id": 7, "instance_id": 8, "seen_at": ago(minutes=1),
+    },
+    {
+        "port": 3103, "proto": "tcp", "bind": "127.0.0.1", "pid": 40012,
+        "comm": "node", "cwd": "/mnt/hyper/Projects/rma/admin-app/.claude/worktrees/expert-request",
+        "cmdline": "node node_modules/.bin/nuxt dev",
+        "unit": "portboard-rma-admin-app-expert-request.service", "container": None,
+        "compose_project": None, "compose_workdir": None,
+        "project_id": 9, "instance_id": 12, "seen_at": ago(minutes=1),
+    },
+    {
+        "port": 8083, "proto": "tcp", "bind": "127.0.0.1", "pid": 40013,
+        "comm": "java", "cwd": "/mnt/hyper/Projects/rma/server-side/.claude/worktrees/expert-request",
+        "cmdline": "java -jar quarkus-run.jar",
+        "unit": "portboard-rma-server-side-expert-request.service", "container": None,
+        "compose_project": None, "compose_workdir": None,
+        "project_id": 7, "instance_id": 13, "seen_at": ago(minutes=1),
     },
     {
         "port": 3300, "proto": "tcp", "bind": "127.0.0.1", "pid": 214233,

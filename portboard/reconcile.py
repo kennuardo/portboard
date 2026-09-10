@@ -125,7 +125,7 @@ class _Registry:
         # port -> (container name, instance) for kind='container' instances: a
         # --network host container runs as root, so ss shows no pid and docker
         # publishes no port; the assigned port is the only handle we have
-        self.container_by_port: dict[int, tuple[str, dict]] = {}
+        self.container_instances: list[tuple[str, dict]] = []
         for inst in self.instances:
             if inst["unit"]:
                 self.by_unit.setdefault(inst["unit"], inst)
@@ -136,8 +136,7 @@ class _Registry:
                 name = _container_name(project, inst)
                 if name:
                     self.by_unit.setdefault(name, inst)
-                    if inst["port"]:
-                        self.container_by_port[int(inst["port"])] = (name, inst)
+                    self.container_instances.append((name, inst))
             try:
                 cid = json.loads(inst.get("extra_json") or "{}").get("container_id")
             except (TypeError, ValueError):
@@ -286,6 +285,15 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
     t0 = time.monotonic()
     ts = db.now()
     machine = _Machine(quick)
+    if not quick:
+        # worktree stacks started by hand (or before registration) get their rows
+        # here, so the GUI shows them without waiting for a Claude session hook
+        try:
+            from . import registry
+
+            registry.sync_worktrees(conn)
+        except Exception as exc:  # pragma: no cover - never let this block a reconcile
+            log.warning("sync_worktrees failed: %s", exc)
     reg = _Registry(conn)
 
     observed_rows: list[dict] = []           # what goes into `observed`
@@ -296,19 +304,39 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
     reserved_seen: dict[int, str] = {}
     unknown = 0
 
-    running_containers = {c.name for c in machine.containers
+    running_containers = {c.name: c for c in machine.containers
                           if str(getattr(c, "state", "")).lower() == "running"}
+    # kind='container' instances whose container runs: the assigned port and the
+    # port the container's own command names (--port N) both count as "its" port
+    container_ports: dict[int, tuple[str, dict]] = {}
+    for name, inst in reg.container_instances:
+        cont = running_containers.get(name)
+        if cont is None:
+            continue
+        hints = [inst["port"], getattr(cont, "cmd_port", None)]
+        if inst["slot"]:
+            # a worktree stack usually carries its port in its own config
+            # (rma-dev.sh writes server.port= into <worktree>/config/...)
+            try:
+                from . import discover
+
+                hints.append(discover.detect_port_from_repo(inst["path"]))
+            except Exception:
+                pass
+        for port in hints:
+            if port:
+                container_ports.setdefault(int(port), (name, inst))
     for listener in machine.listeners:
         seen = _describe(machine, listener)
         inst, project, label, path = _match(reg, seen)
-        if inst is None and seen["pid"] is None and listener.port in reg.container_by_port:
-            name, candidate = reg.container_by_port[listener.port]
-            if name in running_containers:
-                inst = candidate
-                project = reg.project_by_id.get(inst["project_id"])
-                label, path = inst["label"], inst["path"]
-                seen["container"] = name
-                seen["_in_container"] = True
+        if inst is None and seen["pid"] is None and listener.port in container_ports:
+            name, candidate = container_ports[listener.port]
+            inst = candidate
+            project = reg.project_by_id.get(inst["project_id"])
+            label, path = inst["label"], inst["path"]
+            seen["container"] = name
+            seen["_in_container"] = True
+            seen["_cid"] = getattr(running_containers[name], "id", None) or seen.get("_cid")
         row = {k: v for k, v in seen.items() if not k.startswith("_")}
         row["project_id"] = project["id"] if project else None
         row["instance_id"] = inst["id"] if inst else None
@@ -338,6 +366,16 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
             reserved_seen.setdefault(
                 listener.port, seen["comm"] or seen["container"] or "system")
         observed_rows.append(row)
+
+    # a running container whose listener we could not see (root process on a
+    # port nobody told us about) is still running: docker is the truth here
+    for name, inst in reg.container_instances:
+        cont = running_containers.get(name)
+        if cont is None or inst["id"] in matched_ports:
+            continue
+        matched_ports[inst["id"]] = []
+        matched_meta[inst["id"]] = {"pid": getattr(cont, "pid", None), "unit": None,
+                                    "container": name, "_cid": getattr(cont, "id", None)}
 
     # one systemctl call for every matched instance backed by a systemd unit
     units = {reg.instance_by_id[i]["unit"] for i in matched_ports
@@ -378,7 +416,7 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
         for inst_id, ports in matched_ports.items():
             inst = reg.instance_by_id[inst_id]
             meta = matched_meta[inst_id]
-            actual = inst["port"] if inst["port"] in ports else min(ports)
+            actual = inst["port"] if inst["port"] in ports else (min(ports) if ports else None)
             stat = stats.get(inst["unit"] or "", {})
             fields = {
                 "state": "running",

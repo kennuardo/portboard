@@ -228,6 +228,19 @@ reconcile.reconcile(conn, quick=False) -> dict   # summary: {listeners, matched,
   never matched or written to directly — reconcile only ever touches their
   children's instance rows; the group's own row does not exist to reconcile
   against (see Runner contract above).
+* Root-owned host-network containers: `ss` shows no pid and docker publishes
+  no port, so a pid-less listener is attributed to a `kind='container'`
+  instance whose container is running when its port is the instance's
+  assigned port, the port the container's own command/env names
+  (`sysinfo.Container.cmd_port`, `--port N` / `PORT=N`, last one wins) or,
+  for worktree instances, `discover.detect_port_from_repo(instance.path)`
+  (rma-dev.sh writes `server.port=` into the worktree's config). A running
+  container with no visible listener is still `running` (pid from docker,
+  `actual_port` NULL): docker is the truth for containers.
+* Full (non-quick) reconcile first runs `registry.sync_worktrees(conn)`: one
+  listdir of `<project>/.claude/worktrees` per project, creating instance rows
+  (slot + port) for directories that have none, so stacks started by hand or
+  before registration show up without a Claude session hook. Never deletes.
 * Effects: rewrite `observed`; for matched instances set `state=running`,
   `pid`, `actual_port`, `last_seen_at`; for managed instances previously
   `running` but no longer seen set `state=stopped`, `stopped_by='crash'` unless

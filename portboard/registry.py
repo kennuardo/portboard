@@ -782,6 +782,35 @@ def ensure_instance(
     )
 
 
+def sync_worktrees(conn: sqlite3.Connection, source: str = "reconcile") -> list[dict]:
+    """Create instance rows for every ``.claude/worktrees/<slug>`` directory that
+    exists on disk but has no row yet (a worktree stack started by hand, or one
+    created before the project was registered). One listdir per project; never
+    deletes anything. Returns the new instances."""
+    created: list[dict] = []
+    for project in list_projects(conn):
+        if project.get("kind") == "group":
+            continue
+        root = worktree_root(project["path"])
+        try:
+            entries = sorted(os.scandir(root), key=lambda e: e.name)
+        except OSError:
+            continue
+        known = {r["path"] for r in conn.execute(
+            "SELECT path FROM instances WHERE project_id = ?", (project["id"],))}
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False) or entry.name.startswith("."):
+                continue
+            path = normalize_path(entry.path)
+            if path in known:
+                continue
+            try:
+                created.append(ensure_instance(conn, project["id"], path, source=source))
+            except RegistryError as exc:
+                log.warning("sync_worktrees: %s/%s: %s", project["name"], entry.name, exc)
+    return created
+
+
 def update_instance(conn: sqlite3.Connection, instance_id: int, **fields: Any) -> dict:
     instance = conn.execute("SELECT * FROM instances WHERE id = ?", (int(instance_id),)).fetchone()
     if instance is None:

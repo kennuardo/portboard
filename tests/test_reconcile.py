@@ -313,6 +313,51 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(summary["matched"], 0)
         self.assertEqual(self.instance(3)["state"], "stopped")
 
+    def test_worktree_container_matches_the_port_its_command_names(self):
+        # rma-dev.sh slot 2: registry assigned 3104, the container says --port 3103
+        self.add_container_project(2, "rma-admin-app", "rma-admin", 3100)
+        wt = self.tmp / "rma-admin-app" / ".claude" / "worktrees" / "expert-request"
+        wt.mkdir(parents=True)
+        self.add_instance(3, "expert-request", 2, str(wt), 3104, project_id=2)
+        cont = container("rma-admin-expert-request", network="host", pid=800)
+        cont.cmd_port = 3103
+        self.containers = [cont]
+        self.listeners = [listener(3103, pid=None, comm=None)]
+
+        summary = self.run_reconcile()
+
+        self.assertEqual(summary["matched"], 1)
+        inst = self.instance(3)
+        self.assertEqual((inst["state"], inst["actual_port"]), ("running", 3103))
+        self.assertEqual(self.observed(3103)["instance_id"], 3)
+
+    def test_running_container_without_a_visible_listener_is_still_running(self):
+        self.add_container_project(2, "rma-server-side", "rma-api", 8080)
+        self.add_instance(3, "main", 0, str(self.tmp / "rma-server-side"), 8080, project_id=2)
+        self.containers = [container("rma-api", network="host", pid=700)]
+        self.listeners = []  # its java listens on a port nobody told us about
+
+        self.run_reconcile()
+
+        inst = self.instance(3)
+        self.assertEqual((inst["state"], inst["actual_port"], inst["pid"]), ("running", None, 700))
+
+    def test_full_reconcile_creates_rows_for_worktree_dirs_on_disk(self):
+        (self.proj / ".claude" / "worktrees" / "wt2").mkdir(parents=True)
+
+        self.run_reconcile()
+
+        rows = self.conn.execute("SELECT label, slot, port FROM instances WHERE project_id = 1 "
+                                 "ORDER BY slot").fetchall()
+        self.assertEqual([r["label"] for r in rows], ["main", "wt1", "wt2"])
+        self.assertEqual(rows[2]["slot"], 2)
+        self.assertEqual(rows[2]["port"], 4002)
+        # quick mode never touches the disk
+        (self.proj / ".claude" / "worktrees" / "wt3").mkdir()
+        self.run_reconcile(quick=True)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM instances WHERE project_id = 1")
+                         .fetchone()[0], 3)
+
     def test_hand_started_container_matches_a_worktree_by_suffix(self):
         self.add_container_project(2, "rma-admin-app", "rma-admin", 3100)
         self.add_instance(3, "main", 0, str(self.tmp / "rma-admin-app"), 3100, project_id=2)

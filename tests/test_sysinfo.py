@@ -263,5 +263,26 @@ class LiveTest(unittest.TestCase):
             self.assertGreater(p.port, 0)
 
 
+
+
+class CmdPortTest(unittest.TestCase):
+    def test_last_port_flag_wins(self):
+        self.assertEqual(sysinfo.cmd_port(["bash", "-c", "yarn install; exec yarn dev --port 3103 --hostname 0.0.0.0"]), 3103)
+
+    def test_env_port_when_the_command_has_none(self):
+        self.assertEqual(sysinfo.cmd_port(["java", "-jar", "app.jar"], ["SERVER_PORT=8083", "X=1"]), 8083)
+
+    def test_nothing_named(self):
+        self.assertIsNone(sysinfo.cmd_port(["redis-server"], ["PATH=/bin"]))
+
+    def test_inspect_carries_cmd_port(self):
+        cont = sysinfo._container_from_inspect({
+            "Id": "a" * 64, "Name": "/rma-admin", "State": {"Status": "running", "Pid": 5},
+            "Config": {"Image": "node:14", "Cmd": ["yarn", "dev", "--port", "3100"], "Env": []},
+            "HostConfig": {"NetworkMode": "host"}, "NetworkSettings": {"Ports": {}},
+        })
+        self.assertEqual(cont.cmd_port, 3100)
+
+
 if __name__ == "__main__":
     unittest.main()

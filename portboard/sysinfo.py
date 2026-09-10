@@ -56,6 +56,7 @@ class Container:
     compose_workdir: str | None = None
     network_mode: str | None = None
     pid: int | None = None
+    cmd_port: int | None = None   # --port N / PORT=N found in the container's command or env
 
 
 def _run(cmd: list[str], timeout: float) -> subprocess.CompletedProcess | None:
@@ -271,12 +272,36 @@ def _ports_from_inspect(pmap: dict | None) -> list[tuple[int, int]]:
     return out
 
 
+_CMD_PORT_RE = re.compile(r"(?:--port[=\s]+|\b(?:NUXT_|NITRO_|SERVER_)?PORT=)([0-9]{2,5})\b")
+
+
+def cmd_port(cmd: list | str | None, env: list | None = None) -> int | None:
+    """The port a container's own command/env names (``--port 3103``, ``PORT=3103``).
+
+    A --network host container publishes nothing, so this is the only hint of
+    where it listens; the last --port wins (``yarn install; exec yarn dev --port N``).
+    """
+    text = " ".join(cmd) if isinstance(cmd, list) else (cmd or "")
+    hits = _CMD_PORT_RE.findall(text)
+    if not hits:
+        for item in env or ():
+            hits += _CMD_PORT_RE.findall(str(item))
+    if not hits:
+        return None
+    try:
+        return int(hits[-1])
+    except ValueError:
+        return None
+
+
 def _container_from_inspect(c: dict) -> Container:
     cfg = c.get("Config") or {}
     labels = cfg.get("Labels") or {}
     state = c.get("State") or {}
     pid = state.get("Pid") or None
+    command = list(cfg.get("Entrypoint") or []) + list(cfg.get("Cmd") or [])
     return Container(
+        cmd_port=cmd_port(command, cfg.get("Env")),
         id=c.get("Id") or "",
         name=(c.get("Name") or "").lstrip("/"),
         state=state.get("Status") or "",
