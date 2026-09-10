@@ -32,6 +32,9 @@ LAST_STOPPED_KEY = "schedule_last_stopped"
 CPU_BUSY_NS = 2_000_000_000
 NOTIFY_SCRIPT = "~/.claude/hooks/notify-hermes.py"
 NOTIFY_TIMEOUT = 10
+# A kind='group' instance mirrors its primary child, it runs nothing itself:
+# stopping or idle-stopping it would double-handle the children.
+GROUP_REASON = "group: children are handled individually"
 
 
 def _field(obj: Any, key: str, default: Any = None) -> Any:
@@ -109,6 +112,9 @@ def evening_stop(conn: sqlite3.Connection) -> dict:
         if _field(inst, "state") != "running":
             continue
         project = registry.get_project(conn, _field(inst, "project_id"))
+        if _field(project, "kind", None) == "group":
+            result["skipped"].append(_item(inst, GROUP_REASON, project))
+            continue
         pinned = _field(inst, "pinned", None)
         if pinned is None:
             pinned = _field(project, "pinned", 0)
@@ -247,6 +253,9 @@ def tick(conn: sqlite3.Connection) -> dict:
     for inst in instances:
         inst_id = _field(inst, "id")
         project = registry.get_project(conn, _field(inst, "project_id"))
+        if _field(project, "kind", None) == "group":
+            result["skipped"].append(_item(inst, GROUP_REASON, project))
+            continue
         pinned = _field(inst, "pinned", None)
         if pinned is None:
             pinned = _field(project, "pinned", 0)

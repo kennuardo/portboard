@@ -263,6 +263,40 @@ def _int(value: Any, default: int | None = None) -> int | None:
         raise ValueError(f"not an integer: {value!r}")
 
 
+_UNSET = object()
+
+
+def _group_ref(registry, conn, ref: Any) -> dict:
+    """Look up `ref` (a project name or id) and insist it is a group."""
+    group = registry.get_project(conn, ref)
+    if group is None:
+        raise ValueError(f"no project {ref!r} to use as a group")
+    if group.get("kind") != "group":
+        raise ValueError(f"project {ref!r} is not a group (kind {group.get('kind')!r})")
+    return group
+
+
+def _resolve_parent(registry, conn, fields: dict[str, Any]):
+    """Pop `parent` (group name) / `parent_id` (int) and return the parent id.
+
+    Returns `_UNSET` when the body carried neither key, `None` when the caller
+    explicitly cleared the parent (`parent: null` / `"none"` / `""`).
+    """
+    value: Any = _UNSET
+    if "parent_id" in fields:
+        raw = fields.pop("parent_id")
+        value = None if raw in (None, "", "none") else _int(raw)
+    if "parent" in fields:
+        raw = fields.pop("parent")
+        if raw is None or (isinstance(raw, str) and raw.strip().lower() in ("", "none")):
+            value = None
+        elif isinstance(raw, int) and not isinstance(raw, bool):
+            value = int(raw)
+        else:
+            value = _group_ref(registry, conn, raw)["id"]
+    return value
+
+
 def _instance_url(project: dict | None, inst: dict) -> str | None:
     if inst.get("url"):
         return inst["url"]
@@ -373,14 +407,38 @@ def _h_project_add(h: "Handler", m: re.Match):
     if not path:
         raise ValueError("path is required")
     allow_busy = bool(body.pop("allow_busy", False))
+    source = body.pop("source", None) or "gui"
     conn = h.conn()
-    project = _lazy("registry").add_project(
-        conn, path, source=body.pop("source", "gui"), allow_busy=allow_busy, **body
-    )
+    registry = _lazy("registry")
+    if body.get("kind") == "group":
+        project = _add_group(registry, conn, path, body, source)
+    else:
+        parent_id = _resolve_parent(registry, conn, body)
+        if parent_id is not _UNSET:
+            body["parent_id"] = parent_id
+        project = registry.add_project(conn, path, source=source, allow_busy=allow_busy, **body)
     # match an already-running dev server to the new instance right away
     _quick_reconcile(conn)
-    fresh = _lazy("registry").get_project(conn, project["id"])
+    fresh = registry.get_project(conn, project["id"])
     return 201, fresh if isinstance(fresh, dict) else project
+
+
+def _add_group(registry, conn, path: str, body: dict[str, Any], source: str) -> dict:
+    """Register `path` as a group: discover the children, then registry.add_group."""
+    body.pop("kind", None)
+    body.pop("parent", None)
+    body.pop("parent_id", None)
+    suggestion = _lazy("discover").suggest_group(path)
+    if not suggestion:
+        raise ValueError(
+            f"{path} is not a group: no two or more sibling git sub-projects with a "
+            "known stack were found there"
+        )
+    suggestion = dict(suggestion)
+    suggestion.update(body)  # explicit fields from the caller win over the suggestion
+    suggestion["path"] = suggestion.get("path") or path
+    suggestion["kind"] = "group"
+    return registry.add_group(conn, suggestion, source=source)
 
 
 def _h_project_order(h: "Handler", m: re.Match):
@@ -395,13 +453,19 @@ def _h_project_order(h: "Handler", m: re.Match):
 def _h_project_patch(h: "Handler", m: re.Match):
     fields = dict(h.body())
     fields.pop("id", None)
+    allow_busy = bool(fields.pop("allow_busy", False))
     conn = h.conn()
-    project = _lazy("registry").update_project(conn, int(m.group(1)), **fields)
+    registry = _lazy("registry")
+    parent_id = _resolve_parent(registry, conn, fields)
+    if parent_id is not _UNSET:
+        fields["parent_id"] = parent_id
+    # primary_child may be an id or a child name; update_project resolves both
+    project = registry.update_project(conn, int(m.group(1)), allow_busy=allow_busy, **fields)
     if project is None:
         raise NotFound(f"project {m.group(1)} not found")
     if "base_port" in fields or "path" in fields or "kind" in fields:
         _quick_reconcile(conn)
-        fresh = _lazy("registry").get_project(conn, project["id"])
+        fresh = registry.get_project(conn, project["id"])
         if isinstance(fresh, dict):
             project = fresh
     return project
@@ -415,14 +479,32 @@ def _h_project_delete(h: "Handler", m: re.Match):
     project = registry.get_project(conn, pid_)
     if project is None:
         raise NotFound(f"project {pid_} not found")
-    for inst in registry.list_instances(conn, project_id=pid_):
-        if inst.get("state") in ("running", "starting") and inst.get("managed", 1):
-            try:
-                runner.stop(conn, inst["id"], reason="user")
-            except Exception as exc:  # a dead unit must not block the delete
-                log.warning("stopping instance %s before project delete failed: %s", inst["id"], exc)
+    # the delete cascades to children, so their units must be stopped as well
+    for target in [pid_, *_child_ids(registry, conn, project)]:
+        for inst in registry.list_instances(conn, project_id=target):
+            if inst.get("state") in ("running", "starting") and inst.get("managed", 1):
+                try:
+                    runner.stop(conn, inst["id"], reason="user")
+                except Exception as exc:  # a dead unit must not block the delete
+                    log.warning("stopping instance %s before project delete failed: %s",
+                                inst["id"], exc)
     registry.delete_project(conn, pid_)
     return {"ok": True}
+
+
+def _child_ids(registry, conn, project: dict) -> list[int]:
+    """Ids of a group's children (empty for an ordinary project)."""
+    if project.get("kind") != "group":
+        return []
+    children = getattr(registry, "group_children", None)
+    if not callable(children):
+        return []
+    try:
+        rows = children(conn, project["id"]) or []
+        return [int(row["id"]) for row in rows if row.get("id") is not None]
+    except Exception:
+        log.exception("listing children of group %s failed", project.get("name"))
+        return []
 
 
 def _h_project_instances(h: "Handler", m: re.Match):

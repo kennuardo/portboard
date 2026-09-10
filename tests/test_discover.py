@@ -237,6 +237,187 @@ class TestHelpers(FakeRepo):
         self.assertEqual(["web"], [f["name"] for f in discover.scan(root, max_depth=2)])
 
 
+class TestMaven(FakeRepo):
+    def test_maven_spring_boot_detection(self):
+        self.write("pom.xml", "<project></project>\n")
+        self.write("mvnw", "#!/bin/sh\n")
+        found = discover.suggest(self.root)
+        self.assertEqual("transient", found["kind"])
+        self.assertEqual("env", found["port_mode"])
+        self.assertEqual("./mvnw spring-boot:run", found["start_cmd"])
+        self.assertEqual("medium", found["confidence"])
+        self.assertTrue(any("pom.xml + mvnw" in e for e in found["evidence"]))
+        self.assertIsNone(found["base_port"])
+
+    def test_maven_without_mvnw_is_not_spring_boot(self):
+        self.write("pom.xml", "<project></project>\n")
+        found = discover.suggest(self.root)
+        self.assertNotEqual("./mvnw spring-boot:run", (found or {}).get("start_cmd"))
+
+    def test_maven_server_port_in_application_properties(self):
+        self.write("pom.xml", "<project></project>\n")
+        self.write("mvnw", "#!/bin/sh\n")
+        self.write("src/main/resources/application.properties", "server.port=8081\n")
+        found = discover.suggest(self.root)
+        self.assertEqual(8081, found["base_port"])
+        self.assertEqual("medium", found["confidence"])
+        self.assertTrue(any("server.port=8081" in e for e in found["evidence"]))
+
+    def test_maven_server_port_in_application_yml(self):
+        self.write("pom.xml", "<project></project>\n")
+        self.write("mvnw", "#!/bin/sh\n")
+        self.write("src/main/resources/application.yml", "server:\n  port: 8082\n")
+        found = discover.suggest(self.root)
+        self.assertEqual(8082, found["base_port"])
+
+    def test_maven_server_port_in_config_dir(self):
+        self.write("pom.xml", "<project></project>\n")
+        self.write("mvnw", "#!/bin/sh\n")
+        self.write("config/application.properties", "server.port=8083\n")
+        found = discover.suggest(self.root)
+        self.assertEqual(8083, found["base_port"])
+
+
+class TestGroups(unittest.TestCase):
+    """suggest_group / group_of / pick_primary: one directory of sibling repos."""
+
+    def setUp(self) -> None:
+        self.root = tempfile.mkdtemp(prefix="portboard-test-group-")
+
+    def child_dir(self, name: str) -> str:
+        path = os.path.join(self.root, name)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def git(self, path: str) -> None:
+        os.makedirs(os.path.join(path, ".git"), exist_ok=True)
+
+    def nuxt_child(self, name: str) -> str:
+        """A Nuxt child: package.json with {"scripts": {"dev": "nuxt"}}, and .git."""
+        path = self.child_dir(name)
+        self.git(path)
+        with open(os.path.join(path, "package.json"), "w", encoding="utf-8") as fh:
+            json.dump({"name": name, "scripts": {"dev": "nuxt"}}, fh)
+        return path
+
+    def spring_child(self, name: str) -> str:
+        """A Spring child: pom.xml + mvnw, and .git."""
+        path = self.child_dir(name)
+        self.git(path)
+        open(os.path.join(path, "pom.xml"), "w").close()
+        open(os.path.join(path, "mvnw"), "w").close()
+        return path
+
+    def test_suggest_group_positive(self):
+        self.nuxt_child("admin-app")
+        self.spring_child("server-side")
+        result = discover.suggest_group(self.root)
+        self.assertIsNotNone(result)
+        self.assertEqual("group", result["kind"])
+        self.assertEqual("none", result["port_mode"])
+        self.assertIsNone(result["base_port"])
+        self.assertIsNone(result["start_cmd"])
+        group_name = discover._name_for(self.root)
+        self.assertEqual(group_name, result["name"])
+        names = sorted(c["name"] for c in result["children"])
+        self.assertEqual(
+            sorted([f"{group_name}-admin-app", f"{group_name}-server-side"]), names
+        )
+        self.assertEqual(f"{group_name}-admin-app", result["primary"])
+        self.assertEqual("medium", result["confidence"])
+
+    def test_suggest_group_too_few_children(self):
+        self.nuxt_child("admin-app")
+        self.assertIsNone(discover.suggest_group(self.root))
+
+    def test_suggest_group_non_project_child_does_not_count(self):
+        self.nuxt_child("admin-app")
+        # a git repo discover cannot recognise (no manifest at all)
+        stray = self.child_dir("random-notes")
+        self.git(stray)
+        self.assertIsNone(discover.suggest_group(self.root))
+
+    def test_suggest_group_refuses_a_git_directory(self):
+        self.git(self.root)  # the root itself looks like a repository
+        self.nuxt_child("admin-app")
+        self.spring_child("server-side")
+        self.assertIsNone(discover.suggest_group(self.root))
+
+    def test_group_of_projects_root_is_none(self):
+        self.nuxt_child("admin-app")
+        self.spring_child("server-side")
+        self.assertIsNone(discover.group_of(self.root, projects_root=self.root))
+
+    def test_group_of_for_a_child_repo(self):
+        admin = self.nuxt_child("admin-app")
+        self.spring_child("server-side")
+        result = discover.group_of(admin, projects_root=os.path.dirname(self.root))
+        self.assertIsNotNone(result)
+        self.assertEqual("group", result["kind"])
+        self.assertEqual(discover._name_for(self.root), result["name"])
+
+    def test_group_of_for_the_group_dir_itself(self):
+        self.nuxt_child("admin-app")
+        self.spring_child("server-side")
+        result = discover.group_of(self.root, projects_root=os.path.dirname(self.root))
+        self.assertIsNotNone(result)
+        self.assertEqual("group", result["kind"])
+
+    def test_group_of_plain_top_level_repo_is_none(self):
+        projects_root = tempfile.mkdtemp(prefix="portboard-test-proot-")
+        repo = os.path.join(projects_root, "solo-repo")
+        os.makedirs(os.path.join(repo, ".git"))
+        self.assertIsNone(discover.group_of(repo, projects_root=projects_root))
+
+    def test_scan_reports_the_group_not_its_children(self):
+        outer = tempfile.mkdtemp(prefix="portboard-test-scanroot-")
+        group_dir = os.path.join(outer, "rma")
+        os.makedirs(group_dir)
+        admin = os.path.join(group_dir, "admin-app")
+        os.makedirs(os.path.join(admin, ".git"))
+        with open(os.path.join(admin, "package.json"), "w", encoding="utf-8") as fh:
+            json.dump({"scripts": {"dev": "nuxt"}}, fh)
+        server = os.path.join(group_dir, "server-side")
+        os.makedirs(os.path.join(server, ".git"))
+        open(os.path.join(server, "pom.xml"), "w").close()
+        open(os.path.join(server, "mvnw"), "w").close()
+        found = discover.scan(outer, max_depth=1)
+        self.assertEqual(1, len(found))
+        self.assertEqual("group", found[0]["kind"])
+        self.assertEqual("rma", found[0]["name"])
+
+
+class TestPrimaryPick(unittest.TestCase):
+    def test_admin_beats_server(self):
+        self.assertGreater(
+            discover.primary_score("rma-admin-app"), discover.primary_score("rma-server-side")
+        )
+
+    def test_app_beats_api(self):
+        self.assertGreater(discover.primary_score("rma-app"), discover.primary_score("rma-api"))
+
+    def test_pick_primary_admin_over_server(self):
+        children = [
+            {"name": "rma-server-side", "base_port": 4010, "kind": "transient"},
+            {"name": "rma-admin-app", "base_port": 4020, "kind": "transient"},
+        ]
+        self.assertEqual("rma-admin-app", discover.pick_primary(children)["name"])
+
+    def test_pick_primary_ties_break_by_lowest_port(self):
+        children = [
+            {"name": "rma-app-a", "base_port": 4020, "kind": "transient"},
+            {"name": "rma-app-b", "base_port": 4010, "kind": "transient"},
+        ]
+        self.assertEqual(
+            discover.primary_score("rma-app-a", 4020, "transient"),
+            discover.primary_score("rma-app-b", 4010, "transient"),
+        )
+        self.assertEqual("rma-app-b", discover.pick_primary(children)["name"])
+
+    def test_pick_primary_empty_list(self):
+        self.assertIsNone(discover.pick_primary([]))
+
+
 # --------------------------------------------------------------------------
 # Read-only checks against the real repositories on this workstation.
 # --------------------------------------------------------------------------

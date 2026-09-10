@@ -45,6 +45,22 @@ def _print_json(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
 
 
+def _child_line(child: dict, primary_id: int | None = None) -> str:
+    """One indented line describing a group's child project."""
+    port = child.get("base_port") or child.get("port")
+    line = f"  {child.get('name')}"
+    if port:
+        line += f" :{port}"
+    if primary_id is not None and child.get("id") == primary_id:
+        line += " (primary)"
+    return line
+
+
+def _print_children(children: list[dict], primary_id: int | None = None) -> None:
+    for child in children:
+        print(_child_line(child, primary_id))
+
+
 def _print_instance_result(instance: dict, as_json: bool) -> None:
     if as_json:
         _print_json(instance)
@@ -100,6 +116,49 @@ def _instance_for_args(conn, args: argparse.Namespace) -> dict:
 # --------------------------------------------------------------------------
 
 
+def _instance_rows(instances: list[dict]) -> list[list]:
+    """Table rows with a group's children folded in right under the group.
+
+    A child is rendered exactly once: indented and prefixed with its group
+    (``  rma/rma-server-side``) below the group's own row, and skipped where it
+    would otherwise appear in the flat project order.
+    """
+    children_by_parent: dict[str, list[dict]] = {}
+    for inst in instances:
+        parent = inst.get("parent")
+        if parent:
+            children_by_parent.setdefault(parent, []).append(inst)
+
+    rows: list[list] = []
+    seen: set = set()
+
+    def emit(inst: dict, project_label: str) -> None:
+        seen.add(id(inst))
+        rows.append([
+            project_label,
+            inst.get("label"),
+            inst.get("port"),
+            inst.get("actual_port"),
+            inst.get("state"),
+            inst.get("owner_session"),
+            inst.get("url"),
+        ])
+
+    for inst in instances:
+        if id(inst) in seen or inst.get("parent"):
+            continue
+        name = inst.get("project")
+        emit(inst, name)
+        if inst.get("kind") == "group" and not inst.get("slot"):
+            for child in children_by_parent.get(name, []):
+                if id(child) not in seen:
+                    emit(child, f"  {name}/{child.get('project')}")
+    for inst in instances:  # children whose group has no row of its own
+        if id(inst) not in seen:
+            emit(inst, f"  {inst.get('parent')}/{inst.get('project')}")
+    return rows
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     from . import registry
 
@@ -113,7 +172,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     instances: list[dict] = []
     for project in snapshot.get("projects", []):
         projects_by_id[project["id"]] = project
-        instances.extend(project.get("instances", []))
+        for inst in project.get("instances", []):
+            # every view already carries it; belt and braces for the --json shape
+            inst.setdefault("parent", project.get("parent"))
+            instances.append(inst)
     observed = snapshot.get("observed", [])
 
     if args.json:
@@ -122,18 +184,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     _print_table(
         ["PROJECT", "LABEL", "PORT", "ACTUAL", "STATE", "OWNER", "URL"],
-        [
-            [
-                inst.get("project"),
-                inst.get("label"),
-                inst.get("port"),
-                inst.get("actual_port"),
-                inst.get("state"),
-                inst.get("owner_session"),
-                inst.get("url"),
-            ]
-            for inst in instances
-        ],
+        _instance_rows(instances),
     )
     print()
     _print_table(
@@ -196,6 +247,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     try:
         resolved = registry.resolve_path(conn, cwd)
         instances = registry.list_instances(conn, project_id=resolved.project["id"]) if resolved.project else []
+        group_instances = (
+            registry.list_instances(conn, project_id=resolved.group["id"]) if resolved.group else []
+        )
     finally:
         conn.close()
 
@@ -207,7 +261,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"{cwd} is not a registered project")
         return 0
 
-    print(f"project {resolved.project.get('name')} ({resolved.project.get('kind')}) at {resolved.project.get('path')}")
+    from . import hooks
+
+    if resolved.project.get("kind") == "group":
+        print(hooks.format_group_session_start(resolved.project, instances))
+    else:
+        print(f"project {resolved.project.get('name')} ({resolved.project.get('kind')}) at {resolved.project.get('path')}")
+        if resolved.group:
+            group_line = hooks.format_group_line(resolved.group, group_instances)
+            if group_line:
+                print(group_line)
     _print_table(
         ["LABEL", "PORT", "STATE", "OWNER", "URL"],
         [[i.get("label"), i.get("port"), i.get("state"), i.get("owner_session"), i.get("url")] for i in instances],
@@ -224,24 +287,31 @@ def cmd_claim(args: argparse.Namespace) -> int:
         resolved = registry.resolve_path(conn, cwd)
         project = resolved.project
         if project is None:
-            from . import discover
+            from . import discover, hooks
 
-            if not discover.looks_like_project(cwd):
-                raise ValueError(f"{cwd} does not look like a project")
-            suggestion = discover.suggest(cwd)
-            if not suggestion:
-                raise ValueError(f"could not determine a project configuration for {cwd}")
-            project = registry.add_project(
-                conn,
-                suggestion.get("path", cwd),
-                name=suggestion.get("name"),
-                kind=suggestion.get("kind", "transient"),
-                start_cmd=suggestion.get("start_cmd"),
-                base_port=suggestion.get("base_port"),
-                port_mode=suggestion.get("port_mode", "env"),
-                source="cli",
-                allow_busy=True,
-            )
+            is_repo = bool(discover.looks_like_project(cwd))
+            # A directory of sibling sub-repos is ONE project: prefer the group
+            # over registering the single repo the session sits in.
+            group_suggestion = hooks._group_suggestion_for(discover, cwd, is_repo)
+            if group_suggestion:
+                project = registry.add_group(conn, group_suggestion, source="cli", allow_busy=True)
+            else:
+                if not is_repo:
+                    raise ValueError(f"{cwd} does not look like a project")
+                suggestion = discover.suggest(cwd)
+                if not suggestion:
+                    raise ValueError(f"could not determine a project configuration for {cwd}")
+                project = registry.add_project(
+                    conn,
+                    suggestion.get("path", cwd),
+                    name=suggestion.get("name"),
+                    kind=suggestion.get("kind", "transient"),
+                    start_cmd=suggestion.get("start_cmd"),
+                    base_port=suggestion.get("base_port"),
+                    port_mode=suggestion.get("port_mode", "env"),
+                    source="cli",
+                    allow_busy=True,
+                )
             resolved = registry.resolve_path(conn, cwd)
             project = resolved.project
 
@@ -418,14 +488,69 @@ def _reconcile_after_change(conn, registry, project: dict | None) -> dict | None
     return registry.get_project(conn, project["id"]) or project
 
 
+def _group_suggestion_for_add(args: argparse.Namespace) -> dict | None:
+    """The group suggestion `project add` should register, or None.
+
+    `--kind group` demands one (and errors when the directory is not a group);
+    with no `--kind` at all a directory that is not itself a project but holds
+    sibling sub-repos is registered as a group.
+    """
+    from . import discover
+
+    if args.kind == "group":
+        suggestion = discover.suggest_group(args.path)
+        if suggestion is None:
+            raise ValueError(
+                f"{args.path} is not a group: it must not be a git repository itself and needs "
+                f"at least {discover.GROUP_MIN_CHILDREN} sub-directories that are git "
+                "repositories with a recognised stack"
+            )
+        return suggestion
+    if args.kind:
+        return None
+    if discover.suggest(args.path) is not None:
+        return None
+    return discover.suggest_group(args.path)
+
+
+def _parent_group_id(conn, registry, ref: str | None) -> int | None:
+    if not ref:
+        return None
+    parent = registry.get_project(conn, ref)
+    if parent is None:
+        raise ValueError(f"no project named {ref}")
+    if parent.get("kind") != "group":
+        raise ValueError(f"project {parent.get('name')} is not a group (kind {parent.get('kind')})")
+    return parent["id"]
+
+
 def cmd_project_add(args: argparse.Namespace) -> int:
     from . import registry
 
+    group_suggestion = _group_suggestion_for_add(args)
+
     conn = db.connect()
     try:
+        if group_suggestion is not None:
+            if args.name:
+                group_suggestion = dict(group_suggestion)
+                group_suggestion["name"] = args.name
+            project = registry.add_group(conn, group_suggestion, source="cli", allow_busy=True)
+            project = _reconcile_after_change(conn, registry, project)
+            children = registry.group_children(conn, project["id"])
+            primary_id = project.get("primary_child_id")
+            if args.json:
+                _print_json(project)
+            else:
+                print(f"added group {project.get('name')} ({project.get('path')}) "
+                      f"with {len(children)} sub-project{'' if len(children) == 1 else 's'}")
+                _print_children(children, primary_id)
+            return 0
+
         fields = {}
         if args.pinned:
             fields["pinned"] = 1
+        parent_id = _parent_group_id(conn, registry, getattr(args, "parent", None))
         project = registry.add_project(
             conn,
             args.path,
@@ -436,16 +561,21 @@ def cmd_project_add(args: argparse.Namespace) -> int:
             port_mode=args.port_mode or "env",
             source="cli",
             allow_busy=bool(getattr(args, "allow_busy", False)),
+            parent_id=parent_id,
             **fields,
         )
         project = _reconcile_after_change(conn, registry, project)
+        parent_name = project.get("parent")
     finally:
         conn.close()
 
     if args.json:
         _print_json(project)
     else:
-        print(f"added project {project.get('name')} ({project.get('path')})")
+        line = f"added project {project.get('name')} ({project.get('path')})"
+        if parent_name:
+            line += f" in group {parent_name}"
+        print(line)
     return 0
 
 
@@ -472,8 +602,17 @@ def cmd_project_edit(args: argparse.Namespace) -> int:
             fields["pinned"] = 1
         if args.order is not None:
             fields["sort_order"] = args.order
+        if getattr(args, "primary", None):
+            fields["primary_child"] = args.primary
+        parent = getattr(args, "parent", None)
+        if parent is not None:
+            fields["parent_id"] = (
+                None if parent.strip().lower() in ("none", "") else _parent_group_id(conn, registry, parent)
+            )
         if fields:
-            project = registry.update_project(conn, project["id"], **fields)
+            project = registry.update_project(
+                conn, project["id"], allow_busy=bool(getattr(args, "allow_busy", False)), **fields
+            )
             if "base_port" in fields or "kind" in fields:
                 project = _reconcile_after_change(conn, registry, project)
     finally:
@@ -541,6 +680,7 @@ def cmd_project_show(args: argparse.Namespace) -> int:
         if project is None:
             raise ValueError(f"no project named {args.ref}")
         instances = registry.list_instances(conn, project_id=project["id"])
+        children = registry.group_children(conn, project["id"]) if project.get("kind") == "group" else []
     finally:
         conn.close()
 
@@ -549,6 +689,11 @@ def cmd_project_show(args: argparse.Namespace) -> int:
         return 0
 
     print(f"{project.get('name')} ({project.get('kind')}) path={project.get('path')} pinned={bool(project.get('pinned'))}")
+    if project.get("kind") == "group":
+        print(f"sub-projects: {len(children)}")
+        _print_children(children, project.get("primary_child_id"))
+    elif project.get("parent"):
+        print(f"parent: {project.get('parent')}")
     _print_table(
         ["LABEL", "PORT", "STATE", "OWNER", "URL"],
         [[i.get("label"), i.get("port"), i.get("state"), i.get("owner_session"), i.get("url")] for i in instances],
@@ -577,17 +722,21 @@ def cmd_discover(args: argparse.Namespace) -> int:
                 if not path or path in existing_paths:
                     continue
                 try:
-                    project = registry.add_project(
-                        conn,
-                        path,
-                        name=item.get("name"),
-                        kind=item.get("kind", "transient"),
-                        start_cmd=item.get("start_cmd"),
-                        base_port=item.get("base_port"),
-                        port_mode=item.get("port_mode", "env"),
-                        source="discover",
-                        allow_busy=True,
-                    )
+                    if item.get("kind") == "group":
+                        # add_group registers the children too — never separately
+                        project = registry.add_group(conn, item, source="discover", allow_busy=True)
+                    else:
+                        project = registry.add_project(
+                            conn,
+                            path,
+                            name=item.get("name"),
+                            kind=item.get("kind", "transient"),
+                            start_cmd=item.get("start_cmd"),
+                            base_port=item.get("base_port"),
+                            port_mode=item.get("port_mode", "env"),
+                            source="discover",
+                            allow_busy=True,
+                        )
                 except (ValueError, registry.RegistryError) as exc:
                     # one bad suggestion (duplicate port, clashing name) must not
                     # abort the whole import — report it and keep going
@@ -601,13 +750,14 @@ def cmd_discover(args: argparse.Namespace) -> int:
         _print_json({"suggestions": suggestions, "applied": applied, "skipped": skipped})
         return 0
 
-    _print_table(
-        ["PATH", "NAME", "KIND", "CONFIDENCE", "EVIDENCE"],
-        [
-            [s.get("path"), s.get("name"), s.get("kind"), s.get("confidence"), "; ".join(s.get("evidence") or [])]
-            for s in suggestions
-        ],
-    )
+    rows: list[list] = []
+    for s in suggestions:
+        rows.append([s.get("path"), s.get("name"), s.get("kind"), s.get("confidence"),
+                     "; ".join(s.get("evidence") or [])])
+        for child in s.get("children") or ():
+            rows.append([child.get("path"), f"  {child.get('name')}", child.get("kind"),
+                         child.get("confidence"), "; ".join(child.get("evidence") or [])])
+    _print_table(["PATH", "NAME", "KIND", "CONFIDENCE", "EVIDENCE"], rows)
     if applied:
         print(f"registered {len(applied)} project(s)")
     for item in skipped:
@@ -775,6 +925,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int)
     p.add_argument("--port-mode", dest="port_mode", choices=list(config.PORT_MODES))
     p.add_argument("--pinned", action="store_true")
+    p.add_argument("--parent", metavar="GROUP",
+                   help="register the project as a sub-project of this kind='group' project")
     p.add_argument("--allow-busy", action="store_true",
                    help="accept --port even if something already listens on it (e.g. the project itself)")
     p.set_defaults(func=cmd_project_add)
@@ -788,6 +940,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port-mode", dest="port_mode", choices=list(config.PORT_MODES))
     p.add_argument("--pinned", action="store_true")
     p.add_argument("--order", type=int, help="manual position in the GUI list (lower first)")
+    p.add_argument("--primary", metavar="CHILD",
+                   help="groups: the sub-project whose port/state the group shows")
+    p.add_argument("--parent", metavar="GROUP",
+                   help="move the project into this group; 'none' detaches it")
+    p.add_argument("--allow-busy", action="store_true",
+                   help="accept --port even if something already listens on it (e.g. the project itself)")
     p.set_defaults(func=cmd_project_edit)
 
     p = project_sub.add_parser("rm")

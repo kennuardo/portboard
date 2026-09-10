@@ -308,6 +308,241 @@ class TestPathMapping(RegistryTestCase):
         self.assertEqual(inner["id"], found.project["id"])
 
 
+class TestGroups(RegistryTestCase):
+    """kind='group' projects: children carry parent_id, the group mirrors its
+    primary child's main instance."""
+
+    def make_group(self, name: str = "rma", **kwargs) -> dict:
+        path = self.make_dir(name)
+        return registry.add_project(self.conn, path, name=name, kind="group",
+                                    port_mode="none", **kwargs)
+
+    def child(self, group: dict, basename: str, **kwargs) -> dict:
+        path = self.make_dir(group["name"], basename)
+        return registry.add_project(self.conn, path, parent_id=group["id"], **kwargs)
+
+    # naming and validation ------------------------------------------------
+
+    def test_child_without_name_gets_group_prefixed_name(self):
+        group = self.make_group("rma")
+        child = self.child(group, "admin-app")
+        self.assertEqual("rma-admin-app", child["name"])
+        self.assertEqual(group["id"], child["parent_id"])
+
+    def test_parent_must_be_a_group(self):
+        alpha = self.add("alpha")
+        with self.assertRaises(registry.RegistryError):
+            registry.add_project(self.conn, self.make_dir("child"), parent_id=alpha["id"])
+
+    def test_nested_groups_are_refused(self):
+        outer = self.make_group("outer")
+        with self.assertRaises(registry.RegistryError):
+            registry.add_project(self.conn, self.make_dir("inner"), kind="group",
+                                 parent_id=outer["id"])
+
+    def test_child_of_a_child_is_refused(self):
+        outer = self.make_group("outer")
+        mid = self.child(outer, "mid")
+        with self.assertRaises(registry.RegistryError):
+            registry.add_project(self.conn, self.make_dir("outer", "mid", "leaf"),
+                                 parent_id=mid["id"])
+
+    def test_group_cannot_be_its_own_parent(self):
+        group = self.make_group("rma")
+        with self.assertRaises(registry.RegistryError):
+            registry.update_project(self.conn, group["id"], parent_id=group["id"])
+
+    def test_group_forces_no_port_and_no_start_cmd(self):
+        port = free_port(self.conn)
+        group = registry.add_project(
+            self.conn, self.make_dir("rma3"), name="rma3", kind="group",
+            port_mode="env", base_port=port, start_cmd="echo hi",
+        )
+        self.assertEqual("none", group["port_mode"])
+        self.assertIsNone(group["base_port"])
+        self.assertIsNone(group["start_cmd"])
+        main = registry.find_by_ref(self.conn, "rma3")
+        self.assertIsNone(main["port"])
+        self.assertIsNone(main["url"])
+
+    # decoration -------------------------------------------------------------
+
+    def test_group_decoration_fields(self):
+        group = self.make_group("rma")
+        admin = self.child(group, "admin-app")
+        server = self.child(group, "server-side")
+        reloaded = registry.get_project(self.conn, group["id"])
+        self.assertEqual(sorted([admin["id"], server["id"]]), sorted(reloaded["children"]))
+        self.assertEqual(
+            sorted(["rma-admin-app", "rma-server-side"]), sorted(reloaded["child_names"])
+        )
+        self.assertEqual("rma-admin-app", reloaded["primary"])  # heuristic: admin beats server
+        self.assertEqual(admin["id"], reloaded["primary_child_id"])
+        self.assertIsNone(reloaded["parent"])
+        admin_reloaded = registry.get_project(self.conn, admin["id"])
+        self.assertEqual("rma", admin_reloaded["parent"])
+
+    # primary_child ----------------------------------------------------------
+
+    def test_primary_child_explicit_overrides_heuristic(self):
+        group = self.make_group("rma")
+        admin = self.child(group, "admin-app")
+        server = self.child(group, "server-side")
+        self.assertEqual("rma-admin-app", registry.get_project(self.conn, group["id"])["primary"])
+
+        registry.update_project(self.conn, group["id"], primary_child=server["id"])
+        updated = registry.get_project(self.conn, group["id"])
+        self.assertEqual(server["id"], updated["primary_child_id"])
+        self.assertEqual("rma-server-side", updated["primary"])
+
+        registry.update_project(self.conn, group["id"], primary_child="rma-admin-app")
+        updated = registry.get_project(self.conn, group["id"])
+        self.assertEqual(admin["id"], updated["primary_child_id"])
+        self.assertEqual("rma-admin-app", updated["primary"])
+
+    def test_primary_child_refuses_a_non_child(self):
+        group = self.make_group("rma")
+        self.child(group, "admin-app")
+        other = self.add("other")
+        with self.assertRaises(registry.RegistryError):
+            registry.update_project(self.conn, group["id"], primary_child=other["id"])
+        with self.assertRaises(registry.RegistryError):
+            registry.update_project(self.conn, group["id"], primary_child="does-not-exist")
+
+    def test_group_start_order_primary_last(self):
+        group = self.make_group("rma")
+        self.child(group, "api")
+        self.child(group, "mariadb")
+        self.child(group, "admin-app")
+        order = registry.group_start_order(self.conn, registry.get_project(self.conn, group["id"]))
+        names = [c["name"] for c in order]
+        self.assertEqual({"rma-admin-app", "rma-api", "rma-mariadb"}, set(names))
+        self.assertEqual("rma-admin-app", names[-1])  # heuristic primary goes last
+
+    # instance view mirroring -------------------------------------------------
+
+    def test_instance_view_mirrors_the_primary_child(self):
+        group = self.make_group("rma")
+        admin = self.child(group, "admin-app")
+        self.child(group, "server-side")
+        admin_main = registry.find_by_ref(self.conn, admin["name"])
+        registry.update_instance(
+            self.conn, admin_main["id"], state="running",
+            actual_port=admin["base_port"], pid=4242,
+        )
+        group_main = registry.find_by_ref(self.conn, "rma")
+        self.assertEqual("running", group_main["state"])
+        self.assertEqual(admin["base_port"], group_main["port"])
+        self.assertEqual(admin["base_port"], group_main["actual_port"])
+        self.assertEqual(4242, group_main["pid"])
+        self.assertEqual(f"http://localhost:{admin['base_port']}/", group_main["url"])
+        self.assertEqual("rma-admin-app", group_main["primary"])
+        self.assertEqual(admin_main["id"], group_main["primary_instance_id"])
+        self.assertEqual(2, group_main["services_total"])
+        self.assertEqual(1, group_main["services_running"])
+        service_names = sorted(s["project"] for s in group_main["services"])
+        self.assertEqual(["rma-admin-app", "rma-server-side"], service_names)
+
+    # path mapping -------------------------------------------------------------
+
+    def test_resolve_path_group(self):
+        group = self.make_group("rma")
+        admin = self.child(group, "admin-app")
+
+        resolved = registry.resolve_path(self.conn, admin["path"])
+        self.assertEqual(admin["id"], resolved.project["id"])
+        self.assertIsNotNone(resolved.group)
+        self.assertEqual(group["id"], resolved.group["id"])
+
+        nested = os.path.join(admin["path"], "src")
+        os.makedirs(nested, exist_ok=True)
+        resolved_nested = registry.resolve_path(self.conn, nested)
+        self.assertEqual(admin["id"], resolved_nested.project["id"])
+        self.assertEqual(group["id"], resolved_nested.group["id"])
+
+        outside_child = self.make_dir("rma", "docs")
+        resolved_group = registry.resolve_path(self.conn, outside_child)
+        self.assertEqual(group["id"], resolved_group.project["id"])
+        self.assertIsNone(resolved_group.group)
+
+    # delete cascade -------------------------------------------------------------
+
+    def test_delete_group_cascades_to_children(self):
+        group = self.make_group("rma")
+        child = self.child(group, "admin-app")
+        registry.delete_project(self.conn, group["id"])
+        self.assertIsNone(registry.get_project(self.conn, group["id"]))
+        self.assertIsNone(registry.get_project(self.conn, child["id"]))
+        self.assertEqual([], registry.list_instances(self.conn))
+
+    # export / import -------------------------------------------------------------
+
+    def test_export_import_round_trip_preserves_parent_and_primary(self):
+        group = self.make_group("rma")
+        admin = self.child(group, "admin-app")
+        server = self.child(group, "server-side")
+        registry.update_project(self.conn, group["id"], primary_child=server["id"])
+
+        dumped = registry.export_json(self.conn)
+        names_order = [p["name"] for p in dumped["projects"]]
+        self.assertEqual("rma", names_order[0])  # groups exported before children
+
+        registry.delete_project(self.conn, group["id"])
+        self.assertEqual([], registry.list_projects(self.conn))
+
+        summary = registry.import_json(self.conn, dumped)
+        self.assertEqual([], summary["errors"])
+
+        restored_group = registry.get_project(self.conn, "rma")
+        self.assertEqual("rma-server-side", restored_group["primary"])
+        restored_admin = registry.get_project(self.conn, "rma-admin-app")
+        self.assertEqual("rma", restored_admin["parent"])
+
+    # add_group ------------------------------------------------------------------
+
+    def test_add_group_registers_children_from_a_suggestion(self):
+        group_path = self.make_dir("rma")
+        admin_path = self.make_dir("rma", "admin-app")
+        server_path = self.make_dir("rma", "server-side")
+        suggestion = {
+            "path": group_path, "name": "rma", "kind": "group", "port_mode": "none",
+            "children": [
+                {"path": admin_path, "name": "rma-admin-app", "kind": "transient",
+                 "start_cmd": "npm run dev", "port_mode": "env"},
+                {"path": server_path, "name": "rma-server-side", "kind": "transient",
+                 "start_cmd": "./mvnw spring-boot:run", "port_mode": "env"},
+            ],
+            "primary": "rma-admin-app",
+        }
+        group = registry.add_group(self.conn, suggestion)
+        self.assertEqual("group", group["kind"])
+        self.assertIsNone(group["base_port"])
+        self.assertEqual(2, len(group["children"]))
+        self.assertEqual("rma-admin-app", group["primary"])
+
+    def test_add_group_reparents_an_already_registered_child(self):
+        admin_path = self.make_dir("standalone-admin")
+        existing = registry.add_project(self.conn, admin_path, name="rma-admin-app")
+        group_path = self.make_dir("rma")
+        server_path = self.make_dir("rma", "server-side")
+        suggestion = {
+            "path": group_path, "name": "rma", "kind": "group", "port_mode": "none",
+            "children": [
+                {"path": admin_path, "name": "rma-admin-app"},
+                {"path": server_path, "name": "rma-server-side", "kind": "transient",
+                 "start_cmd": "true"},
+            ],
+            "primary": "rma-admin-app",
+        }
+        group = registry.add_group(self.conn, suggestion)
+        reloaded_admin = registry.get_project(self.conn, existing["id"])
+        self.assertEqual(group["id"], reloaded_admin["parent_id"])
+        self.assertEqual("rma-admin-app", group["primary"])
+        self.assertEqual(
+            sorted(["rma-admin-app", "rma-server-side"]), sorted(group["child_names"])
+        )
+
+
 class TestPorts(RegistryTestCase):
     def test_port_is_free_sees_a_real_listener(self):
         port = free_port(self.conn)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -140,28 +141,35 @@ def session_start(conn, payload: dict) -> str | None:
             except Exception:
                 return None
             try:
-                if not discover.looks_like_project(cwd):
-                    return None
-                suggestion = discover.suggest(cwd)
+                is_repo = bool(discover.looks_like_project(cwd))
+                # A directory of sibling sub-repos is ONE project: prefer the
+                # group over registering the single repo the session sits in.
+                group_suggestion = _group_suggestion_for(discover, cwd, is_repo)
+                suggestion = None if group_suggestion else (discover.suggest(cwd) if is_repo else None)
             except Exception:
                 log.exception("session_start: discover failed for %s", cwd)
                 return None
-            if not suggestion:
+            if not group_suggestion and not suggestion:
                 return None
             try:
-                project = registry.add_project(
-                    conn,
-                    suggestion.get("path", cwd),
-                    name=suggestion.get("name"),
-                    kind=suggestion.get("kind", "transient"),
-                    start_cmd=suggestion.get("start_cmd"),
-                    base_port=suggestion.get("base_port"),
-                    port_mode=suggestion.get("port_mode", "env"),
-                    source="hook",
-                    allow_busy=True,
-                )
+                if group_suggestion:
+                    project = registry.add_group(
+                        conn, group_suggestion, source="hook", allow_busy=True
+                    )
+                else:
+                    project = registry.add_project(
+                        conn,
+                        suggestion.get("path", cwd),
+                        name=suggestion.get("name"),
+                        kind=suggestion.get("kind", "transient"),
+                        start_cmd=suggestion.get("start_cmd"),
+                        base_port=suggestion.get("base_port"),
+                        port_mode=suggestion.get("port_mode", "env"),
+                        source="hook",
+                        allow_busy=True,
+                    )
             except Exception:
-                log.exception("session_start: add_project failed for %s", cwd)
+                log.exception("session_start: registration failed for %s", cwd)
                 return None
             try:  # the quick pass above ran before this project existed
                 reconcile.reconcile(conn, quick=True)
@@ -194,13 +202,128 @@ def session_start(conn, payload: dict) -> str | None:
         except Exception:
             instances = [instance]
 
-        return _format_session_start(project, instance, instances, is_worktree)
+        if project.get("kind") == "group" and not is_worktree:
+            return format_group_session_start(project, instances)
+
+        group_line = None
+        group = getattr(resolved, "group", None)
+        if group:
+            try:
+                group_instances = registry.list_instances(conn, project_id=group["id"])
+            except Exception:
+                log.exception("session_start: list_instances for group %s failed", group.get("name"))
+                group_instances = []
+            group_line = format_group_line(group, group_instances)
+
+        return _format_session_start(project, instance, instances, is_worktree, group_line=group_line)
     finally:
         elapsed_ms = (time.monotonic() - start) * 1000
         log.info("session_start took %.1f ms", elapsed_ms)
 
 
-def _format_session_start(project: dict, instance: dict, instances: list[dict], is_worktree: bool) -> str:
+def _group_suggestion_for(discover, cwd: str, is_repo: bool) -> dict | None:
+    """The group suggestion covering *cwd*, or None.
+
+    ``discover.group_of`` answers for a repository (its parent directory) and
+    for a group directory itself; a plain sub-directory of a group (rma/tools)
+    is neither, so its parent is tried as well. The result is only accepted
+    when it actually contains *cwd*.
+    """
+    try:
+        real = os.path.realpath(os.path.expanduser(cwd))
+    except Exception:
+        return None
+    group_of = getattr(discover, "group_of", None)
+    if group_of is None:
+        return None
+    candidates = [real] if is_repo else [real, os.path.dirname(real)]
+    for candidate in candidates:
+        if not candidate or candidate == os.sep:
+            continue
+        try:
+            suggestion = group_of(candidate)
+        except Exception:
+            log.exception("session_start: discover.group_of(%s) failed", candidate)
+            continue
+        if not suggestion:
+            continue
+        gpath = suggestion.get("path")
+        if not gpath:
+            continue
+        if is_repo or real == gpath or real.startswith(gpath.rstrip(os.sep) + os.sep):
+            return suggestion
+    return None
+
+
+def _service_state(service: dict) -> str:
+    state = service.get("state") or "unknown"
+    return state if state in ("running", "starting", "failed") else "not running"
+
+
+def _service_bit(service: dict) -> str:
+    name = service.get("project") or service.get("name") or "?"
+    port = service.get("port") or service.get("actual_port")
+    state = _service_state(service)
+    return f"{name} :{port} ({state})" if port else f"{name} ({state})"
+
+
+def _group_main_view(instances: list[dict]) -> dict | None:
+    """The group's own main instance view (slot 0) — it mirrors the primary child."""
+    for inst in instances or ():
+        if not inst.get("slot") or inst.get("label") == "main":
+            return inst
+    return None
+
+
+def format_group_line(group: dict, group_instances: list[dict]) -> str | None:
+    """One line naming the group, its primary child and the other services."""
+    view = _group_main_view(group_instances)
+    services = list((view or {}).get("services") or [])
+    if not services:
+        return None
+    primary_name = (view or {}).get("primary") or group.get("primary")
+    primary = next((s for s in services if s.get("project") == primary_name), None)
+    others = [s for s in services if s is not primary]
+    name = group.get("name")
+    if primary is None:
+        return f"part of group {name}: " + ", ".join(_service_bit(s) for s in services)
+    line = f"part of group {name}: primary {_service_bit(primary)}"
+    if others:
+        line += "; also " + ", ".join(_service_bit(s) for s in others)
+    return line
+
+
+def format_group_session_start(project: dict, instances: list[dict]) -> str:
+    """Session-start block for a cwd that IS the group directory."""
+    view = _group_main_view(instances)
+    services = list((view or {}).get("services") or [])
+    name = project.get("name")
+    path = project.get("path")
+    lines = [f"[portboard] group {name} at {path} ({len(services)} services)"]
+
+    primary_name = (view or {}).get("primary") or project.get("primary")
+    primary = next((s for s in services if s.get("project") == primary_name), None)
+    if primary is not None:
+        port = primary.get("port") or primary.get("actual_port")
+        url = primary.get("url") or (f"http://localhost:{port}/" if port else "?")
+        lines.append(f"frontend: {primary_name} :{port or '?'}, test URL {url}")
+    else:
+        lines.append("frontend: none yet, set one with: portboard project edit "
+                     f"{name} --primary <child>")
+
+    if services:
+        lines.append("services: " + ", ".join(_service_bit(s) for s in services))
+    else:
+        lines.append("no sub-projects registered yet")
+
+    lines.append(
+        f"start everything with the MCP tool instance_start (cwd={path}) or: portboard start {name}"
+    )
+    return "\n".join(lines)
+
+
+def _format_session_start(project: dict, instance: dict, instances: list[dict], is_worktree: bool,
+                          group_line: str | None = None) -> str:
     name = project.get("name")
     label = instance.get("label", "main")
     branch = instance.get("branch")
@@ -217,6 +340,8 @@ def _format_session_start(project: dict, instance: dict, instances: list[dict], 
         lines.append(f"assigned port {port}, test URL {url}")
     else:
         lines.append("no port assigned yet")
+    if group_line:
+        lines.append(group_line)
 
     status_bits = []
     for inst in instances:
@@ -308,6 +433,9 @@ def pre_tool_use(conn, payload: dict) -> dict | None:
         instances = registry.list_instances(conn)
     except Exception:
         instances = []
+    # A group's main instance MIRRORS its primary child (same port, same
+    # server): counting it would deny the child its own port.
+    instances = [i for i in instances if i.get("kind") != "group"]
 
     if explicit_port is not None:
         for inst in instances:

@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import tempfile
 import types
 import unittest
@@ -19,6 +20,7 @@ _STATE_DIR = tempfile.mkdtemp(prefix="portboard-test-mcp-")
 os.environ["PORTBOARD_STATE_DIR"] = _STATE_DIR
 
 from portboard import config, db, mcp  # noqa: E402
+from portboard import discover as _real_discover  # noqa: E402
 
 from tests import assert_isolated  # noqa: E402
 
@@ -37,22 +39,47 @@ class RunnerError(Exception):
 class Resolved:
     """Stand-in for registry.Resolved."""
 
-    def __init__(self, project=None, instance=None, label=None, is_worktree=False, slug=None, path=None):
+    def __init__(self, project=None, instance=None, label=None, is_worktree=False, slug=None,
+                 path=None, group=None):
         self.project = project
         self.instance = instance
         self.label = label
         self.is_worktree = is_worktree
         self.slug = slug
         self.path = path
+        self.group = group
 
 
 PROJECT = {"id": 1, "name": "demo", "path": "/repo/demo", "kind": "transient",
-           "base_port": 4000, "open_path": "/"}
+           "base_port": 4000, "open_path": "/", "parent": None}
 MAIN = {"id": 5, "project_id": 1, "label": "main", "slot": 0, "path": "/repo/demo",
         "port": 4000, "actual_port": None, "state": "stopped", "owner_session": None}
 WORKTREE = {"id": 6, "project_id": 1, "label": "fix-login", "slot": 1,
             "path": "/repo/demo/.claude/worktrees/fix-login", "port": 4001,
             "actual_port": 4001, "state": "running", "owner_session": "sess-1"}
+
+# --- a group: /projects/rma with two sub-repos, admin-app is the primary -----
+GROUP = {"id": 10, "name": "rma", "path": "/projects/rma", "kind": "group",
+         "base_port": None, "open_path": "/", "parent": None,
+         "children": [11, 12], "child_names": ["rma-admin-app", "rma-server-side"],
+         "primary_child_id": 11, "primary": "rma-admin-app"}
+CHILD = {"id": 11, "name": "rma-admin-app", "path": "/projects/rma/admin-app",
+         "kind": "transient", "base_port": 5100, "open_path": "/", "parent": "rma"}
+CHILD_MAIN = {"id": 21, "project_id": 11, "project": "rma-admin-app", "label": "main", "slot": 0,
+              "path": "/projects/rma/admin-app", "port": 5100, "actual_port": 5100,
+              "state": "running", "owner_session": None, "parent": "rma",
+              "url": "http://localhost:5100/"}
+SERVICE_MAIN = {"id": 22, "project_id": 12, "project": "rma-server-side", "label": "main", "slot": 0,
+                "path": "/projects/rma/server-side", "port": 5101, "actual_port": None,
+                "state": "stopped", "owner_session": None, "parent": "rma",
+                "url": "http://localhost:5101/"}
+# the group's own main instance mirrors the primary child and lists the services
+GROUP_MAIN = {"id": 20, "project_id": 10, "project": "rma", "label": "main", "slot": 0,
+              "path": "/projects/rma", "port": 5100, "actual_port": 5100, "state": "running",
+              "owner_session": None, "parent": None, "url": "http://localhost:5100/",
+              "primary": "rma-admin-app", "primary_instance_id": 21,
+              "services": [CHILD_MAIN, SERVICE_MAIN],
+              "services_running": 1, "services_total": 2}
 
 
 def make_fake_modules():
@@ -64,6 +91,8 @@ def make_fake_modules():
     registry.get_instance = mock.MagicMock(return_value=MAIN)
     registry.list_instances = mock.MagicMock(return_value=[MAIN, WORKTREE])
     registry.add_project = mock.MagicMock(return_value=PROJECT)
+    registry.add_group = mock.MagicMock(return_value=GROUP)
+    registry.update_project = mock.MagicMock(return_value=GROUP)
     registry.ensure_instance = mock.MagicMock(return_value=MAIN)
     registry.set_owner = mock.MagicMock(return_value=None)
 
@@ -82,6 +111,8 @@ def make_fake_modules():
         "name": "demo", "kind": "transient", "start_cmd": "npm run dev",
         "port_mode": "env", "base_port": None, "confidence": 0.9, "evidence": ["package.json"],
     })
+    discover.suggest_group = mock.MagicMock(return_value=None)
+    discover.group_of = mock.MagicMock(return_value=None)
 
     return {
         "portboard.registry": registry,
@@ -338,7 +369,8 @@ class CallToolTest(FakeModuleTestCase):
         self.assertEqual({i["id"] for i in data["instances"]}, {5, 6})
         compact = data["instances"][0]
         self.assertEqual(set(compact), {"id", "project", "label", "port", "actual_port",
-                                        "state", "url", "owner_session", "worktree"})
+                                        "state", "url", "owner_session", "worktree", "parent"})
+        self.assertIsNone(compact["parent"])
         self.assertEqual(compact["url"], "http://localhost:4000/")
         self.assertFalse(compact["worktree"])
         self.assertTrue(data["instances"][1]["worktree"])
@@ -494,6 +526,250 @@ class CallToolTest(FakeModuleTestCase):
         result = mcp.call_tool("project_register", {"path": "/repo/demo"})
         self.assertTrue(result["isError"])
         self.assertIn("path already registered", payload_of(result)["error"])
+
+
+class GroupToolTest(FakeModuleTestCase):
+    """project_status / project_claim / project_register with kind='group'."""
+
+    def group_instances(self, project_id=None):
+        """list_instances(project_id=<group>) -> the mirroring main instance."""
+        if project_id == GROUP["id"]:
+            return [GROUP_MAIN]
+        if project_id == CHILD["id"]:
+            return [CHILD_MAIN]
+        return [MAIN, WORKTREE]
+
+    def use_group(self):
+        self.registry.list_instances.side_effect = lambda conn, project_id=None: self.group_instances(project_id)
+
+    def test_project_status_inside_a_child_carries_the_group(self):
+        self.use_group()
+        self.registry.resolve_path.return_value = Resolved(CHILD, CHILD_MAIN, "main", group=GROUP)
+        data = payload_of(mcp.call_tool("project_status", {"cwd": "/projects/rma/admin-app"}))
+        self.assertEqual(data["project"]["name"], "rma-admin-app")
+        group = data["group"]
+        self.assertEqual(group["name"], "rma")
+        self.assertEqual(group["path"], "/projects/rma")
+        self.assertEqual(group["primary"], "rma-admin-app")
+        self.assertEqual(group["primary_port"], 5100)
+        self.assertEqual(group["url"], "http://localhost:5100/")
+        self.assertEqual([s["name"] for s in group["services"]], ["rma-admin-app", "rma-server-side"])
+        self.assertEqual([s["port"] for s in group["services"]], [5100, 5101])
+        self.assertEqual([s["state"] for s in group["services"]], ["running", "stopped"])
+        self.assertEqual(group["services"][1]["url"], "http://localhost:5101/")
+        self.assertEqual(data["this"]["parent"], "rma")
+
+    def test_project_status_without_a_group_has_group_none(self):
+        self.registry.resolve_path.return_value = Resolved(PROJECT, MAIN, "main")
+        data = payload_of(mcp.call_tool("project_status", {"cwd": "/repo/demo"}))
+        self.assertIn("group", data)
+        self.assertIsNone(data["group"])
+
+    def test_project_status_on_the_group_dir_shows_the_primary_port(self):
+        self.use_group()
+        self.registry.resolve_path.return_value = Resolved(GROUP, GROUP_MAIN, "main")
+        data = payload_of(mcp.call_tool("project_status", {"cwd": "/projects/rma"}))
+        self.assertEqual(data["project"]["kind"], "group")
+        self.assertEqual(data["assigned_port"], 5100)
+        self.assertEqual(data["url"], "http://localhost:5100/")
+        self.assertEqual(data["group"]["name"], "rma")
+        self.assertEqual(len(data["group"]["services"]), 2)
+
+    def test_project_status_on_a_portless_group_falls_back_to_the_group_view(self):
+        self.use_group()
+        self.registry.resolve_path.return_value = Resolved(GROUP, None, "main")
+        data = payload_of(mcp.call_tool("project_status", {"cwd": "/projects/rma"}))
+        self.assertIsNone(data["this"])
+        self.assertEqual(data["assigned_port"], 5100)
+        self.assertEqual(data["url"], "http://localhost:5100/")
+
+    def test_project_claim_registers_an_unknown_group_directory(self):
+        self.use_group()
+        suggestion = {"path": "/projects/rma", "name": "rma", "kind": "group",
+                      "children": [{"name": "rma-admin-app"}, {"name": "rma-server-side"}],
+                      "primary": "rma-admin-app"}
+        self.discover.group_of.return_value = suggestion
+        self.registry.resolve_path.side_effect = [None, Resolved(GROUP, GROUP_MAIN, "main")]
+        with mock.patch.object(mcp, "_git_root", return_value=None):
+            data = payload_of(mcp.call_tool("project_claim", {"cwd": "/projects/rma"}))
+        self.discover.group_of.assert_called_once_with("/projects/rma")
+        args, kwargs = self.registry.add_group.call_args
+        self.assertIs(args[1], suggestion)
+        self.assertEqual(kwargs["source"], "mcp")
+        self.assertTrue(kwargs["allow_busy"])
+        self.registry.add_project.assert_not_called()
+        self.assertEqual(data["project"]["name"], "rma")
+        self.assertEqual(data["group"]["primary"], "rma-admin-app")
+        self.assertEqual(
+            data["start_hint"],
+            "instance_start(cwd='/projects/rma')  # starts every service, frontend last",
+        )
+
+    def test_project_claim_inside_a_child_repo_registers_the_whole_group(self):
+        self.use_group()
+        self.discover.group_of.return_value = {"path": "/projects/rma", "name": "rma",
+                                               "kind": "group", "children": [], "primary": None}
+        self.registry.resolve_path.side_effect = [None, Resolved(CHILD, CHILD_MAIN, "main", group=GROUP)]
+        with mock.patch.object(mcp, "_git_root", return_value="/projects/rma/admin-app"):
+            data = payload_of(mcp.call_tool("project_claim", {"cwd": "/projects/rma/admin-app"}))
+        self.registry.add_group.assert_called_once()
+        self.registry.add_project.assert_not_called()
+        self.assertEqual(data["project"]["name"], "rma-admin-app")
+        self.assertEqual(data["group"]["name"], "rma")
+        # a child is started on its own, so no group start hint
+        self.assertEqual(data["start_hint"], "instance_start(cwd='/projects/rma/admin-app')")
+
+    def test_project_claim_falls_back_to_a_single_project(self):
+        self.registry.resolve_path.side_effect = [None, Resolved(PROJECT, MAIN, "main")]
+        with mock.patch.object(mcp, "_git_root", return_value="/repo/demo"):
+            data = payload_of(mcp.call_tool("project_claim", {"cwd": "/repo/demo"}))
+        self.registry.add_group.assert_not_called()
+        self.registry.add_project.assert_called_once()
+        self.assertIsNone(data["group"])
+
+    def test_project_register_kind_group_uses_add_group(self):
+        suggestion = {"path": "/projects/rma", "name": "rma", "kind": "group",
+                      "children": [{"name": "rma-admin-app"}], "primary": "rma-admin-app"}
+        self.discover.suggest_group.return_value = suggestion
+        self.registry.get_project.return_value = GROUP
+        data = payload_of(mcp.call_tool("project_register", {"path": "/projects/rma", "kind": "group"}))
+        self.discover.suggest_group.assert_called_once_with("/projects/rma")
+        args, kwargs = self.registry.add_group.call_args
+        self.assertEqual(args[1]["name"], "rma")
+        self.assertEqual(kwargs["source"], "mcp")
+        self.registry.add_project.assert_not_called()
+        self.assertEqual(data["name"], "rma")
+
+    def test_project_register_group_applies_an_explicit_name_and_primary(self):
+        self.discover.suggest_group.return_value = {"path": "/projects/rma", "name": "rma",
+                                                    "kind": "group", "children": [], "primary": None}
+        self.registry.get_project.return_value = GROUP
+        mcp.call_tool("project_register", {"path": "/projects/rma", "kind": "group",
+                                           "name": "rma-suite", "primary": "rma-admin-app"})
+        args, _ = self.registry.add_group.call_args
+        self.assertEqual(args[1]["name"], "rma-suite")
+        args, kwargs = self.registry.update_project.call_args
+        self.assertEqual(args[1], GROUP["id"])
+        self.assertEqual(kwargs["primary_child"], "rma-admin-app")
+
+    def test_project_register_group_without_sub_projects_is_an_error(self):
+        self.discover.suggest_group.return_value = None
+        result = mcp.call_tool("project_register", {"path": "/projects/rma", "kind": "group"})
+        self.assertTrue(result["isError"])
+        self.assertIn("no sub-projects found under /projects/rma", payload_of(result)["error"])
+        self.registry.add_group.assert_not_called()
+
+    def test_project_register_detects_a_group_without_an_explicit_kind(self):
+        self.discover.suggest.return_value = None
+        self.discover.suggest_group.return_value = {"path": "/projects/rma", "name": "rma",
+                                                    "kind": "group", "children": [], "primary": None}
+        self.registry.get_project.return_value = GROUP
+        data = payload_of(mcp.call_tool("project_register", {"path": "/projects/rma"}))
+        self.registry.add_group.assert_called_once()
+        self.assertEqual(data["kind"], "group")
+
+    def test_project_register_with_a_parent_passes_parent_id(self):
+        self.registry.get_project.return_value = GROUP
+        payload_of(mcp.call_tool("project_register", {"path": "/projects/rma/admin-app", "parent": "rma"}))
+        self.registry.get_project.assert_any_call(mock.ANY, "rma")
+        _, kwargs = self.registry.add_project.call_args
+        self.assertEqual(kwargs["parent_id"], GROUP["id"])
+
+    def test_project_register_with_an_unknown_parent_is_an_error(self):
+        self.registry.get_project.return_value = None
+        result = mcp.call_tool("project_register", {"path": "/repo/demo", "parent": "nope"})
+        self.assertTrue(result["isError"])
+        self.assertIn("no project named 'nope'", payload_of(result)["error"])
+        self.registry.add_project.assert_not_called()
+
+    def test_project_register_parent_must_be_a_group(self):
+        self.registry.get_project.return_value = PROJECT
+        result = mcp.call_tool("project_register", {"path": "/repo/demo", "parent": "demo"})
+        self.assertTrue(result["isError"])
+        self.assertIn("is not a group", payload_of(result)["error"])
+        self.registry.add_project.assert_not_called()
+
+    def test_compact_carries_the_parent_group(self):
+        assert_isolated()
+        self.registry.list_instances.return_value = [CHILD_MAIN]
+        conn = db.connect()
+        try:
+            conn.execute("DELETE FROM observed")
+            conn.execute("DELETE FROM reserved_ports")
+        finally:
+            conn.close()
+        data = payload_of(mcp.call_tool("ports_list", {}))
+        self.assertEqual(data["instances"][0]["parent"], "rma")
+
+    def test_port_whois_carries_the_parent_group(self):
+        assert_isolated()
+        self.registry.get_instance.return_value = CHILD_MAIN
+        self.registry.get_project.return_value = CHILD
+        conn = db.connect()
+        try:
+            conn.execute("DELETE FROM observed")
+            conn.execute("INSERT INTO observed(port, proto, bind, pid, comm, project_id, instance_id, seen_at) "
+                         "VALUES (5100, 'tcp', '*', 42, 'node', 11, 21, ?)", (db.now(),))
+        finally:
+            conn.close()
+        data = payload_of(mcp.call_tool("port_whois", {"port": 5100}))
+        self.assertEqual(data["instance"]["parent"], "rma")
+
+    def test_group_tools_are_documented(self):
+        by_name = {t["name"]: t for t in mcp.TOOLS}
+        for name in ("project_status", "project_claim"):
+            self.assertIn("group", by_name[name]["description"].lower(), name)
+        register = by_name["project_register"]
+        self.assertIn("group", register["description"].lower())
+        props = register["inputSchema"]["properties"]
+        self.assertIn("primary", props)
+        self.assertIn("parent", props)
+        self.assertIn("container", props["kind"]["description"])
+        self.assertIn("group", props["kind"]["description"])
+
+
+class GroupDiscoveryFixtureTest(FakeModuleTestCase):
+    """project_claim on a real tmp tree, with only registry faked."""
+
+    def setUp(self):
+        super().setUp()
+        # the real discover module must see the tmp tree
+        patcher = mock.patch.dict("sys.modules", {"portboard.discover": _real_discover})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        tmp = tempfile.mkdtemp(prefix="portboard-test-group-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.group_dir = os.path.join(os.path.realpath(tmp), "rma")
+        for child in ("admin-app", "server-side"):
+            d = os.path.join(self.group_dir, child)
+            os.makedirs(os.path.join(d, ".git"))
+            with open(os.path.join(d, "package.json"), "w") as fh:
+                json.dump({"scripts": {"dev": "nuxt"}}, fh)
+
+    def test_claim_on_the_group_directory_registers_a_group(self):
+        self.registry.list_instances.side_effect = (
+            lambda conn, project_id=None: [GROUP_MAIN] if project_id == GROUP["id"] else [])
+        self.registry.resolve_path.side_effect = [None, Resolved(GROUP, GROUP_MAIN, "main")]
+        data = payload_of(mcp.call_tool("project_claim", {"cwd": self.group_dir}))
+        args, _ = self.registry.add_group.call_args
+        suggestion = args[1]
+        self.assertEqual(suggestion["kind"], "group")
+        self.assertEqual({c["name"] for c in suggestion["children"]},
+                         {"rma-admin-app", "rma-server-side"})
+        self.assertEqual(suggestion["primary"], "rma-admin-app")
+        self.registry.add_project.assert_not_called()
+        self.assertIn("starts every service", data["start_hint"])
+
+    def test_claim_inside_a_child_repo_registers_the_whole_group(self):
+        self.registry.list_instances.side_effect = (
+            lambda conn, project_id=None: [GROUP_MAIN] if project_id == GROUP["id"] else [CHILD_MAIN])
+        self.registry.resolve_path.side_effect = [None, Resolved(CHILD, CHILD_MAIN, "main", group=GROUP)]
+        child = os.path.join(self.group_dir, "admin-app")
+        data = payload_of(mcp.call_tool("project_claim", {"cwd": child}))
+        args, _ = self.registry.add_group.call_args
+        self.assertEqual(args[1]["path"], self.group_dir)
+        self.assertEqual(data["group"]["name"], "rma")
+        self.assertEqual(data["group"]["services"][0]["port"], 5100)
 
 
 class GitRootTest(unittest.TestCase):

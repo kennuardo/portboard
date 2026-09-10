@@ -551,7 +551,11 @@ def add_project(
     return _project_row(conn, project_id)  # refreshed
 
 
-def update_project(conn: sqlite3.Connection, project_id: int, **fields: Any) -> dict:
+def update_project(conn: sqlite3.Connection, project_id: int, allow_busy: bool = False,
+                   **fields: Any) -> dict:
+    """Change project fields. allow_busy=True accepts a new base_port that is
+    busy right now as long as no other registered project/instance owns it
+    (the project's own hand-started server is listening there)."""
     project = _project_row(conn, int(project_id))
     if project is None:
         raise RegistryError(f"no project with id {project_id}")
@@ -579,7 +583,13 @@ def update_project(conn: sqlite3.Connection, project_id: int, **fields: Any) -> 
     if new_port is not None:
         new_port = int(new_port)
     if "base_port" in fields and new_port != project["base_port"]:
-        if new_port is not None and not port_is_free(
+        if new_port is not None and allow_busy:
+            if new_port <= 0 or new_port > MAX_PORT:
+                raise RegistryError(f"port {new_port} is out of range")
+            owned = _registered_ports(conn) - {project["base_port"], (main or {}).get("port")}
+            if new_port in owned:
+                raise RegistryError(f"port {new_port} is already registered to another project")
+        elif new_port is not None and not port_is_free(
             conn, new_port, exclude_instance_id=(main or {}).get("id")
         ):
             raise RegistryError(f"port {new_port} is not free")

@@ -7,6 +7,7 @@ SQLite schema, so state transitions are asserted against real rows.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -64,6 +65,10 @@ def safe_label(label: str) -> str:
     return re.sub(r"[^a-z0-9-]+", "-", str(label or "").lower()).strip("-")
 
 
+class RegistryError(Exception):
+    """Stand-in for registry.RegistryError (find_by_ref raises it)."""
+
+
 def make_registry() -> dict:
     """Fake registry.* functions on top of the real schema."""
 
@@ -106,12 +111,47 @@ def make_registry() -> dict:
             )
         return get_instance(conn, instance_id)
 
+    def group_children(conn, group_id):
+        rows = conn.execute(
+            "SELECT * FROM projects WHERE parent_id = ? ORDER BY sort_order, name",
+            (int(group_id),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def primary_child(conn, group):
+        children = group_children(conn, group["id"])
+        wanted = group.get("primary_child")
+        for child in children:
+            if wanted is not None and int(child["id"]) == int(wanted):
+                return child
+        return children[0] if children else None
+
+    def group_start_order(conn, group):
+        children = group_children(conn, group["id"])
+        primary = primary_child(conn, group)
+        if primary is None:
+            return children
+        return [c for c in children if c["id"] != primary["id"]] + [primary]
+
+    def find_by_ref(conn, ref):
+        name, _, label = str(ref).partition("@")
+        row = conn.execute(
+            "SELECT i.* FROM instances i JOIN projects p ON p.id = i.project_id"
+            " WHERE p.name = ? AND i.label = ?", (name, label or "main")).fetchone()
+        if row is None:
+            raise RegistryError(f"no instance {ref}")
+        return _augment(conn, row)
+
     return {
         "get_project": get_project,
         "get_instance": get_instance,
         "list_instances": list_instances,
         "update_instance": update_instance,
         "safe_label": safe_label,
+        "group_children": group_children,
+        "primary_child": primary_child,
+        "group_start_order": group_start_order,
+        "find_by_ref": find_by_ref,
+        "RegistryError": RegistryError,
     }
 
 
@@ -160,10 +200,11 @@ class ProcInfo:
 
 
 class Container:
-    def __init__(self, name, compose_project, state="running", pid=None, ports=()):
+    def __init__(self, name, compose_project=None, state="running", pid=None, ports=(),
+                 cid=None):
         self.name, self.compose_project, self.state = name, compose_project, state
         self.pid, self.ports = pid, list(ports)
-        self.id = name
+        self.id = cid or name
         self.image = "img"
         self.compose_workdir = "/tmp"
         self.network_mode = "bridge"
@@ -261,6 +302,26 @@ class TestNaming(RunnerTestCase):
         self.assertEqual(runner.compose_project_name(project, main), "shop")
         self.assertEqual(runner.compose_project_name(project, work), "shop-fix-login")
 
+    def test_container_name_main_vs_worktree(self):
+        project = self.add_project(name="rma-admin-app", kind="container",
+                                   start_cmd="rma-admin", port_mode="fixed", base_port=3100)
+        main = self.add_instance(project, port=3100)
+        work = self.add_instance(project, label="CSV/Attributes", slot=1, port=3101)
+        self.assertEqual(runner.container_name(project, main), "rma-admin")
+        self.assertEqual(runner.container_name(project, work), "rma-admin-csv-attributes")
+        self.assertIsNone(runner.systemd_unit_of(project, main))
+
+    def test_container_name_without_start_cmd_is_empty(self):
+        project = self.add_project(name="nameless", kind="container", start_cmd=None)
+        instance = self.add_instance(project, port=3105)
+        self.assertEqual(runner.container_name(project, instance), "")
+
+    def test_systemd_unit_of_group_is_none(self):
+        group = self.add_project(name="rma", kind="group", start_cmd=None,
+                                 port_mode="none", base_port=None)
+        instance = self.add_instance(group, port=None)
+        self.assertIsNone(runner.systemd_unit_of(group, instance))
+
 
 class TestBuildEnv(RunnerTestCase):
     def test_env_mode_sets_port_trio(self):
@@ -270,6 +331,7 @@ class TestBuildEnv(RunnerTestCase):
         self.assertEqual(env["PORT"], "4310")
         self.assertEqual(env["NUXT_PORT"], "4310")
         self.assertEqual(env["NITRO_PORT"], "4310")
+        self.assertEqual(env["SERVER_PORT"], "4310")   # Spring Boot
         self.assertEqual(env["PORTBOARD_PROJECT"], "demo")
         self.assertEqual(env["PORTBOARD_INSTANCE"], str(instance["id"]))
         self.assertNotIn("HOST", env)
@@ -278,7 +340,7 @@ class TestBuildEnv(RunnerTestCase):
         project = self.add_project(port_mode="arg", start_cmd="uvicorn app:app --port {port}")
         instance = self.add_instance(project, port=4310)
         env = runner.build_env(self.conn, project, instance)
-        for key in ("PORT", "NUXT_PORT", "NITRO_PORT"):
+        for key in ("PORT", "NUXT_PORT", "NITRO_PORT", "SERVER_PORT"):
             self.assertNotIn(key, env)
 
     def test_path_prefers_project_prepend_then_node_path(self):
@@ -541,6 +603,41 @@ class TestStartOtherKinds(RunnerTestCase):
         self.assertEqual(call["argv"], ["/bin/sh", "-c", "docker compose up -d --build"])
         self.assertEqual(call["cwd"], "/tmp/shop")
 
+    def test_container_kind_starts_the_named_container(self):
+        project = self.add_project(name="rma-admin-app", path="/tmp/rma/admin-app",
+                                   kind="container", start_cmd="rma-admin",
+                                   port_mode="fixed", base_port=3100)
+        instance = self.add_instance(project, label="csv-attributes", slot=1, port=3101)
+        fake = FakeRun()
+        self.sysinfo(
+            listening_ports=mock.Mock(return_value=[Listener(3101, pid=888)]),
+            docker_containers=mock.Mock(return_value=[
+                Container("rma-admin-csv-attributes", cid="f" * 64, pid=888)]),
+            proc_info=mock.Mock(return_value=ProcInfo(888, container="f" * 12)),
+        )
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            result = runner.start(self.conn, instance["id"])
+        self.assertEqual(fake.calls[0]["argv"],
+                         ["docker", "start", "rma-admin-csv-attributes"])
+        self.assertEqual(fake.calls[0]["timeout"], runner.DOCKER_START_TIMEOUT)
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(result["unit"], "rma-admin-csv-attributes")
+        self.assertEqual(result["pid"], 888)
+
+    def test_container_kind_missing_container_says_create_it(self):
+        project = self.add_project(name="rma-admin-app", path="/tmp/rma/admin-app",
+                                   kind="container", start_cmd="rma-admin",
+                                   port_mode="fixed", base_port=3100)
+        instance = self.add_instance(project, port=3100)
+        fake = FakeRun(rules=[("docker start", (1, "", "Error: No such container: rma-admin"))])
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            with self.assertRaises(runner.RunnerError) as ctx:
+                runner.start(self.conn, instance["id"])
+        self.assertIn("rma-admin does not exist", str(ctx.exception))
+        self.assertIn("create it first", str(ctx.exception))
+        self.assertEqual(self.row(instance["id"])["state"], "failed")
+
     def test_none_kind_cannot_start(self):
         project = self.add_project(kind="none", start_cmd=None, port_mode="none")
         instance = self.add_instance(project, port=None)
@@ -602,6 +699,32 @@ class TestStop(RunnerTestCase):
         self.assertEqual(fake.calls[0]["argv"],
                          ["docker", "compose", "--project-directory", "/tmp/shop", "stop"])
         self.assertNotIn("down", " ".join(fake.calls[0]["argv"]))
+
+    def test_container_stop_uses_docker_stop(self):
+        project = self.add_project(name="rma-admin-app", path="/tmp/rma/admin-app",
+                                   kind="container", start_cmd="rma-admin",
+                                   port_mode="fixed", base_port=3100)
+        instance = self.add_instance(project, label="csv-attributes", slot=1, port=3101,
+                                     state="running", pid=888)
+        fake = FakeRun()
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            result = runner.stop(self.conn, instance["id"])
+        self.assertEqual(fake.calls[0]["argv"],
+                         ["docker", "stop", "rma-admin-csv-attributes"])
+        self.assertEqual(fake.calls[0]["timeout"], runner.STOP_TIMEOUT)
+        self.assertEqual(result["state"], "stopped")
+
+    def test_container_stop_tolerates_missing_container(self):
+        project = self.add_project(name="rma-admin-app", path="/tmp/rma/admin-app",
+                                   kind="container", start_cmd="rma-admin",
+                                   port_mode="fixed", base_port=3100)
+        instance = self.add_instance(project, port=3100, state="running")
+        fake = FakeRun(rules=[("docker stop", (1, "", "Error response: No such container: rma-admin"))])
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            result = runner.stop(self.conn, instance["id"])
+        self.assertEqual(result["state"], "stopped")
 
     def test_stop_cmd_override(self):
         project = self.add_project(stop_cmd="pkill -f 'npm run dev'")
@@ -733,6 +856,86 @@ class TestStatusMany(RunnerTestCase):
         runner.status_many(self.conn)
         info.docker_containers.assert_not_called()
 
+    def test_container_instances_use_the_same_docker_ps_pass(self):
+        compose = self.add_project(name="shop", path="/tmp/shop", kind="compose",
+                                   start_cmd=None, base_port=8080)
+        compose_instance = self.add_instance(compose, port=8080)
+        project = self.add_project(name="rma-admin-app", path="/tmp/rma/admin-app",
+                                   kind="container", start_cmd="rma-admin",
+                                   port_mode="fixed", base_port=3100)
+        main = self.add_instance(project, port=3100)
+        work = self.add_instance(project, label="csv-attributes", slot=1, port=3101)
+
+        containers = mock.Mock(return_value=[
+            Container("shop-web-1", "shop", pid=999),
+            Container("rma-admin", cid="a" * 64, pid=4242),
+        ])
+        self.sysinfo(docker_containers=containers)
+        result = runner.status_many(self.conn)
+
+        self.assertEqual(containers.call_count, 1)
+        self.assertEqual(result[main["id"]]["state"], "running")
+        self.assertEqual(result[main["id"]]["pid"], 4242)
+        self.assertEqual(result[main["id"]]["unit"], "rma-admin")
+        self.assertEqual(result[main["id"]]["unit_active"], "active")
+        # the worktree container is not up
+        self.assertEqual(result[work["id"]]["state"], "stopped")
+        self.assertEqual(result[work["id"]]["unit"], "rma-admin-csv-attributes")
+        self.assertEqual(result[compose_instance["id"]]["state"], "running")
+
+
+class TestWaitForListenContainer(RunnerTestCase):
+    """The listener of a --network host container is matched through its cgroup."""
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.add_project(name="rma-admin-app", path="/tmp/rma/admin-app",
+                                        kind="container", start_cmd="rma-admin",
+                                        port_mode="fixed", base_port=3100)
+        self.instance = self.add_instance(self.project, port=3100)
+        self.cid = "b" * 64
+
+    def wait(self, **sysinfo_attrs):
+        self.sysinfo(**sysinfo_attrs)
+        with mock.patch.object(runner, "POLL_INTERVAL", 0.0):
+            return runner.wait_for_listen(self.conn, self.project, self.instance, 1)
+
+    def test_matches_by_container_id_prefix(self):
+        hit = self.wait(
+            listening_ports=mock.Mock(return_value=[Listener(3999, pid=4242)]),
+            docker_containers=mock.Mock(return_value=[
+                Container("rma-admin", cid=self.cid, pid=1)]),
+            proc_info=mock.Mock(return_value=ProcInfo(4242, container=self.cid[:12])),
+        )
+        self.assertEqual(hit, {"port": 3999, "pid": 4242})
+
+    def test_matches_by_container_pid(self):
+        hit = self.wait(
+            listening_ports=mock.Mock(return_value=[Listener(3999, pid=4242)]),
+            docker_containers=mock.Mock(return_value=[
+                Container("rma-admin", cid=self.cid, pid=4242)]),
+            proc_info=mock.Mock(return_value=ProcInfo(4242)),
+        )
+        self.assertEqual(hit, {"port": 3999, "pid": 4242})
+
+    def test_matches_by_published_host_port(self):
+        hit = self.wait(
+            listening_ports=mock.Mock(return_value=[Listener(3100, pid=None)]),
+            docker_containers=mock.Mock(return_value=[
+                Container("rma-admin", cid=self.cid, ports=[(3100, 80)])]),
+        )
+        self.assertEqual(hit, {"port": 3100, "pid": None})
+
+    def test_another_containers_listener_is_not_a_match(self):
+        with self.assertRaises(runner.RunnerError) as ctx:
+            self.wait(
+                listening_ports=mock.Mock(return_value=[Listener(9999, pid=4242)]),
+                docker_containers=mock.Mock(return_value=[
+                    Container("someone-else", cid="c" * 64, pid=7)]),
+                proc_info=mock.Mock(return_value=ProcInfo(4242, container="c" * 12)),
+            )
+        self.assertIn("rma-admin did not start listening", str(ctx.exception))
+
 
 class TestLogs(RunnerTestCase):
     def test_journalctl_for_transient(self):
@@ -758,6 +961,226 @@ class TestLogs(RunnerTestCase):
                          ["docker", "compose", "--project-directory", "/tmp/shop",
                           "logs", "--tail", "20", "--no-color"])
         self.assertEqual(text, "web-1 | up")
+
+    def test_docker_logs_for_a_container_instance(self):
+        project = self.add_project(name="rma-admin-app", path="/tmp/rma/admin-app",
+                                   kind="container", start_cmd="rma-admin",
+                                   port_mode="fixed", base_port=3100)
+        instance = self.add_instance(project, label="csv-attributes", slot=1, port=3101)
+        fake = FakeRun(default=(0, "nuxt ready", ""))
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            text = runner.logs(self.conn, instance["id"], lines=5)
+        self.assertEqual(fake.calls[0]["argv"],
+                         ["docker", "logs", "--tail", "5", "rma-admin-csv-attributes"])
+        self.assertEqual(text, "nuxt ready")
+
+
+# --------------------------------------------------------------------------
+# groups
+# --------------------------------------------------------------------------
+
+class GroupTestCase(RunnerTestCase):
+    """A group of three children; the API child is the primary, so it starts last."""
+
+    def setUp(self):
+        super().setUp()
+        self.group = self.add_project(name="rma", path="/tmp/rma", kind="group",
+                                      start_cmd=None, port_mode="none", base_port=None)
+        self.group_instance = self.add_instance(self.group, port=None)
+        self.db = self.add_child("rma-db", 4200, sort_order=1)
+        self.api = self.add_child("rma-api", 4210, sort_order=2)
+        self.front = self.add_child("rma-front", 4220, sort_order=3)
+        self.conn.execute("UPDATE projects SET primary_child = ? WHERE id = ?",
+                          (self.api["id"], self.group["id"]))
+        self.group = self.registry.get_project(self.conn, self.group["id"])
+
+    def add_child(self, name, port, sort_order=0, kind="transient", state="stopped",
+                  **fields):
+        project = self.add_project(name=name, path=f"/tmp/rma/{name}", kind=kind,
+                                   base_port=port, parent_id=self.group["id"],
+                                   sort_order=sort_order, **fields)
+        instance = self.add_instance(project, port=port, state=state)
+        return {"project": project, "instance": instance, "id": project["id"],
+                "instance_id": instance["id"]}
+
+    def units_started(self, fake):
+        out = []
+        for call in fake.calls:
+            argv = call["argv"]
+            if argv and argv[0] == "systemd-run":
+                out += [a[len("--unit="):] for a in argv if a.startswith("--unit=")]
+        return out
+
+    def units_stopped(self, fake):
+        return [c["argv"][-1] for c in fake.calls
+                if c["argv"][:3] == ["systemctl", "--user", "stop"]]
+
+
+class TestGroupStart(GroupTestCase):
+    def test_children_start_in_order_with_the_primary_last(self):
+        fake = FakeRun()
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            result = runner.start(self.conn, self.group_instance["id"], wait=False)
+
+        self.assertEqual(self.units_started(fake),
+                         ["portboard-rma-db-main.service",
+                          "portboard-rma-front-main.service",
+                          "portboard-rma-api-main.service"])
+        self.assertEqual([c["name"] for c in result["children"]],
+                         ["rma-db", "rma-front", "rma-api"])
+        self.assertEqual({c["state"] for c in result["children"]}, {"starting"})
+        # the group's own row is never written
+        self.assertEqual(self.row(self.group_instance["id"])["state"], "stopped")
+
+        event = [e for e in self.events() if e["kind"] == "group.start"]
+        self.assertEqual(len(event), 1)
+        detail = json.loads(event[0]["detail"])
+        self.assertEqual(detail["started"], ["rma-db", "rma-front", "rma-api"])
+        self.assertEqual(detail, {"started": ["rma-db", "rma-front", "rma-api"],
+                                  "skipped": [], "failed": []})
+
+    def test_kind_none_child_is_skipped_not_started(self):
+        self.add_child("rma-legacy", 4230, sort_order=0, kind="none", start_cmd=None,
+                       port_mode="fixed")
+        fake = FakeRun()
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            result = runner.start(self.conn, self.group_instance["id"], wait=False)
+
+        self.assertNotIn("portboard-rma-legacy-main.service", self.units_started(fake))
+        legacy = next(c for c in result["children"] if c["name"] == "rma-legacy")
+        self.assertEqual(legacy["note"], "kind none: observe only (not running)")
+        detail = json.loads(
+            [e for e in self.events() if e["kind"] == "group.start"][0]["detail"])
+        self.assertEqual(detail["skipped"], ["rma-legacy"])
+        self.assertEqual(detail["started"], ["rma-db", "rma-front", "rma-api"])
+
+    def test_a_failing_child_is_named_but_the_others_still_start(self):
+        fake = FakeRun(rules=[("portboard-rma-front-main", (1, "", "Unit already exists"))])
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            with self.assertRaises(runner.RunnerError) as ctx:
+                runner.start(self.conn, self.group_instance["id"], wait=False)
+
+        message = str(ctx.exception)
+        self.assertIn("rma-front", message)
+        self.assertIn("Unit already exists", message)
+        self.assertNotIn("rma-db", message)
+        # the ones before and after it were started anyway
+        self.assertEqual(self.units_started(fake),
+                         ["portboard-rma-db-main.service",
+                          "portboard-rma-front-main.service",
+                          "portboard-rma-api-main.service"])
+        self.assertEqual(self.row(self.db["instance_id"])["state"], "starting")
+        self.assertEqual(self.row(self.api["instance_id"])["state"], "starting")
+        self.assertEqual(self.row(self.front["instance_id"])["state"], "failed")
+        detail = json.loads(
+            [e for e in self.events() if e["kind"] == "group.start"][0]["detail"])
+        self.assertEqual(detail["started"], ["rma-db", "rma-api"])
+        self.assertEqual(len(detail["failed"]), 1)
+        self.assertTrue(detail["failed"][0].startswith("rma-front:"))
+
+    def test_worktree_label_prefers_the_childs_worktree_instance(self):
+        work = self.add_instance(self.front["project"], label="fix-css", slot=1, port=4221)
+        group_work = self.add_instance(self.group, label="fix-css", slot=1, port=None)
+        fake = FakeRun()
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            result = runner.start(self.conn, group_work["id"], wait=False)
+        started = self.units_started(fake)
+        self.assertIn("portboard-rma-front-fix-css.service", started)
+        # children without that worktree fall back to their main instance
+        self.assertIn("portboard-rma-db-main.service", started)
+        ids = {c["name"]: c["instance_id"] for c in result["children"]}
+        self.assertEqual(ids["rma-front"], work["id"])
+
+
+class TestGroupStop(GroupTestCase):
+    def _run_all(self):
+        for child in (self.db, self.api, self.front):
+            self.registry.update_instance(self.conn, child["instance_id"], state="running")
+
+    def test_children_stop_in_reverse_start_order(self):
+        self._run_all()
+        fake = FakeRun()
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            result = runner.stop(self.conn, self.group_instance["id"], reason="schedule")
+
+        self.assertEqual(self.units_stopped(fake),
+                         ["portboard-rma-api-main.service",
+                          "portboard-rma-front-main.service",
+                          "portboard-rma-db-main.service"])
+        self.assertEqual([c["name"] for c in result["children"]],
+                         ["rma-api", "rma-front", "rma-db"])
+        self.assertEqual(self.row(self.db["instance_id"])["stopped_by"], "schedule")
+        self.assertEqual(self.row(self.group_instance["id"])["state"], "stopped")
+        self.assertIsNone(self.row(self.group_instance["id"])["stopped_by"])
+        detail = json.loads(
+            [e for e in self.events() if e["kind"] == "group.stop"][0]["detail"])
+        self.assertEqual(detail["stopped"], ["rma-api", "rma-front", "rma-db"])
+        self.assertEqual(detail["reason"], "schedule")
+
+    def test_a_child_that_cannot_be_stopped_is_collected_not_raised(self):
+        self._run_all()
+        fake = FakeRun(rules=[
+            ("portboard-rma-front-main", (1, "", "Interactive authentication required")),
+        ])
+        self.sysinfo()
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            result = runner.stop(self.conn, self.group_instance["id"])
+
+        self.assertEqual(len(self.units_stopped(fake)), 3)
+        detail = json.loads(
+            [e for e in self.events() if e["kind"] == "group.stop"][0]["detail"])
+        self.assertEqual(detail["stopped"], ["rma-api", "rma-db"])
+        self.assertEqual(len(detail["failed"]), 1)
+        self.assertTrue(detail["failed"][0].startswith("rma-front:"))
+        note = next(c["note"] for c in result["children"] if c["name"] == "rma-front")
+        self.assertIn("Interactive authentication", note)
+        self.assertEqual(self.row(self.front["instance_id"])["state"], "running")
+
+
+class TestGroupStatusAndLogs(GroupTestCase):
+    def test_status_derives_from_the_primary_child(self):
+        self.sysinfo(unit_cgroup_stats=mock.Mock(return_value={
+            "portboard-rma-api-main.service": {"ActiveState": "active", "MainPID": "77",
+                                               "MemoryCurrent": "2048"},
+            "portboard-rma-db-main.service": {"ActiveState": "active", "MainPID": "78"},
+            "portboard-rma-front-main.service": {"ActiveState": "inactive"},
+        }))
+        result = runner.status_many(self.conn)
+        row = result[self.group_instance["id"]]
+        self.assertEqual(row["state"], "running")       # the primary (rma-api) runs
+        self.assertEqual(row["pid"], 77)
+        self.assertEqual(row["mem_bytes"], 2048)
+        self.assertEqual((row["services_running"], row["services_total"]), (2, 3))
+
+    def test_status_of_the_group_alone_still_looks_at_the_children(self):
+        self.sysinfo(unit_cgroup_stats=mock.Mock(return_value={
+            "portboard-rma-api-main.service": {"ActiveState": "inactive"},
+            "portboard-rma-db-main.service": {"ActiveState": "active", "MainPID": "78"},
+            "portboard-rma-front-main.service": {"ActiveState": "active", "MainPID": "79"},
+        }))
+        result = runner.status_many(self.conn, [self.group_instance["id"]])
+        self.assertEqual(list(result), [self.group_instance["id"]])
+        row = result[self.group_instance["id"]]
+        self.assertEqual(row["state"], "stopped")       # primary is down
+        self.assertEqual((row["services_running"], row["services_total"]), (2, 3))
+
+    def test_logs_concatenate_every_child_with_a_header(self):
+        self.registry.update_instance(self.conn, self.api["instance_id"], state="running")
+        fake = FakeRun(default=(0, "some output", ""))
+        with mock.patch("portboard.runner.subprocess.run", fake):
+            text = runner.logs(self.conn, self.group_instance["id"], lines=7)
+        self.assertIn("== rma-api (running) ==", text)
+        self.assertIn("== rma-db (stopped) ==", text)
+        self.assertIn("== rma-front (stopped) ==", text)
+        self.assertEqual(text.count("some output"), 3)
+        self.assertTrue(all("-n" in c["argv"] and "7" in c["argv"] for c in fake.calls))
+        # display order, not start order
+        self.assertLess(text.index("== rma-db"), text.index("== rma-api"))
 
 
 if __name__ == "__main__":

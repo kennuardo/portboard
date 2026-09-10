@@ -49,6 +49,17 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
 
 
+def _container_name(project: dict | None, instance: dict) -> str:
+    """Container backing a kind='container' instance (runner.container_name).
+
+    ``runner`` only imports ``config`` and ``db`` at module level, so borrowing
+    its pure naming helper keeps the two in step without a cycle.
+    """
+    from . import runner
+
+    return runner.container_name(project or {}, instance)
+
+
 def _static_ports(conn: sqlite3.Connection) -> list[int]:
     raw = db.get_setting(conn, "reserved_static", "") or ""
     out = []
@@ -114,6 +125,13 @@ class _Registry:
         for inst in self.instances:
             if inst["unit"]:
                 self.by_unit.setdefault(inst["unit"], inst)
+            project = self.project_by_id.get(inst["project_id"]) or {}
+            if project.get("kind") == "container":
+                # a container started by hand never got a unit written, but its
+                # name is derivable: index it so its listener still matches
+                name = _container_name(project, inst)
+                if name:
+                    self.by_unit.setdefault(name, inst)
             try:
                 cid = json.loads(inst.get("extra_json") or "{}").get("container_id")
             except (TypeError, ValueError):
@@ -389,7 +407,11 @@ def reconcile(conn: sqlite3.Connection, quick: bool = False, adopt_unknown: bool
             if inst["state"] != "running":
                 continue  # 'starting' belongs to the runner, stopped/failed stay
             kind = (reg.project_by_id.get(inst["project_id"]) or {}).get("kind")
-            if not machine.docker and kind in ("compose", "none"):
+            if kind == "group":
+                # a group has no listener of its own; its row mirrors the
+                # primary child and must never be marked crashed
+                continue
+            if not machine.docker and kind in ("compose", "none", "container"):
                 # quick mode did not look at docker: a bridge-published or
                 # host-network container is simply invisible here, not gone
                 continue

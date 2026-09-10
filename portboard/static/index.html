@@ -201,6 +201,28 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 .port { font-family: var(--mono); font-weight: 600; }
 .drift { color: var(--amber); font-family: var(--mono); font-weight: 600; }
 .owner { font-family: var(--mono); }
+
+/* ------------------------------------------- group cards: services block */
+.services { padding: 6px 10px 8px; border-top: 1px solid var(--border); background: var(--panel-2); }
+.services .svc-head {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .3px;
+  color: var(--faint); font-weight: 600; padding-bottom: 3px;
+}
+.svc { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 3px 0; }
+.svc + .svc { border-top: 1px dashed var(--border); }
+.svc .name { font-weight: 600; }
+.svc .spacer { flex: 1 1 auto; }
+.svc .pill { font-size: 10.5px; padding: 1px 6px; }
+.svc .svc-acts { display: inline-flex; gap: 4px; flex: 0 0 auto; }
+.svc-sum { color: var(--muted); font-size: 11.5px; padding-top: 5px; }
+.svc-sum .port { color: var(--text); }
+.badge.primary { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.child-insts { border-top: 1px solid var(--border); }
+.child-insts .child-head {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .3px;
+  color: var(--faint); font-weight: 600; padding: 6px 10px 0;
+}
+.inst .label .sub { font-weight: 400; }
 pre.logs {
   margin: 7px 0 0; padding: 8px; border-radius: 6px;
   background: var(--sunken); border: 1px solid var(--border);
@@ -379,12 +401,15 @@ td.acts { white-space: nowrap; }
           <option value="transient">transient (systemd-run)</option>
           <option value="unit">unit (existing --user unit)</option>
           <option value="compose">compose (docker compose)</option>
+          <option value="container">container (existing docker container)</option>
+          <option value="group">group (directory of sub-projects)</option>
           <option value="none">none (observe only)</option>
         </select>
       </label>
     </div>
-    <label class="field"><span>Start command</span><input type="text" name="start_cmd" class="mono" placeholder="npm run dev  |  sheron-dev.service"></label>
-    <div class="fields2">
+    <div class="field"><span class="hint" id="kind-hint">group: directory of sub-projects, children are discovered automatically · container: existing docker container name in start command</span></div>
+    <label class="field" id="reg-start-cmd"><span>Start command</span><input type="text" name="start_cmd" class="mono" placeholder="npm run dev  |  sheron-dev.service"></label>
+    <div class="fields2" id="reg-ports">
       <label class="field"><span>Port mode</span>
         <select name="port_mode">
           <option value="env">env (PORT / NUXT_PORT / NITRO_PORT)</option>
@@ -632,6 +657,46 @@ td.acts { white-space: nowrap; }
     q("#reconciled").innerHTML = "reconciled <b title=\"" + attr(rec || "") + '">' + esc(fmtAgo(rec)) + "</b>";
   }
 
+  // A group project (kind 'group') has no port of its own: its children are
+  // separate projects joined by parent_id, rendered inside the group card.
+  function isGroup(project) { return !!project && project.kind === "group"; }
+
+  function topLevelProjects(state) {
+    return ((state && state.projects) || []).filter(function (p) {
+      return p.parent_id === null || p.parent_id === undefined;
+    });
+  }
+
+  function childrenOf(project, state) {
+    state = state || STATE;
+    var all = (state && state.projects) || [];
+    var out = [];
+    (project.children || []).forEach(function (cid) {
+      var kid = all.filter(function (p) { return String(p.id) === String(cid); })[0];
+      if (kid && out.indexOf(kid) === -1) { out.push(kid); }
+    });
+    // defensive: a child whose id is missing from children[] still belongs here
+    all.forEach(function (p) {
+      if (String(p.parent_id) === String(project.id) && out.indexOf(p) === -1) { out.push(p); }
+    });
+    return out;
+  }
+
+  function mainInstance(project) {
+    var list = (project && project.instances) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (!list[i].slot) { return list[i]; }
+    }
+    return null;
+  }
+
+  // The mirrored main instance of a group carries `services`: one main
+  // instance view per child, in display order.
+  function groupServices(project) {
+    var main = mainInstance(project);
+    return (main && main.services) || [];
+  }
+
   function matchesFilter(project, inst) {
     if (!filterText) { return true; }
     var f = filterText.toLowerCase();
@@ -640,6 +705,20 @@ td.acts { white-space: nowrap; }
       hay = [inst.label, inst.branch, inst.port, inst.actual_port, inst.path, project.name];
     } else {
       hay = [project.name, project.path, project.base_port, project.kind, project.notes];
+      if (isGroup(project)) {
+        // typing a child name or one of its ports must show the group card
+        hay = hay.concat(project.child_names || []);
+        childrenOf(project).forEach(function (kid) {
+          hay.push(kid.name);
+          hay.push(kid.base_port);
+          (kid.instances || []).forEach(function (i) {
+            hay.push(i.label); hay.push(i.branch); hay.push(i.port); hay.push(i.actual_port);
+          });
+        });
+        groupServices(project).forEach(function (s) {
+          hay.push(s.project); hay.push(s.port); hay.push(s.actual_port);
+        });
+      }
     }
     for (var i = 0; i < hay.length; i++) {
       if (hay[i] !== null && hay[i] !== undefined && String(hay[i]).toLowerCase().indexOf(f) !== -1) { return true; }
@@ -647,18 +726,32 @@ td.acts { white-space: nowrap; }
     return false;
   }
 
-  function instanceHtml(project, inst) {
+  // `prefix` names the owning project when the row is shown inside another
+  // card (a child's worktree instance listed in its group's card).
+  function instanceHtml(project, inst, prefix) {
     var running = inst.state === "running";
     var starting = inst.state === "starting";
     var canStart = !running && !starting && project.kind !== "none";
     var canStop = inst.state !== "stopped";
     var drift = inst.actual_port && inst.port && inst.actual_port !== inst.port;
     var url = inst.url || null;
+    var groupMain = isGroup(project) && !inst.slot;
+    if (groupMain) {
+      // the row mirrors the primary child, but the buttons drive the whole
+      // stack: keep Start usable while a startable service is still down and
+      // Stop usable while any service is still up (kind 'none' never starts)
+      var svcs = inst.services || [];
+      var up = function (s) { return s.state === "running" || s.state === "starting"; };
+      canStart = !starting && (svcs.length === 0
+        ? !running
+        : svcs.some(function (s) { return s.kind !== "none" && !up(s); }));
+      canStop = canStop || svcs.some(up);
+    }
     var h = [];
 
     h.push('<div class="inst" data-instance="' + attr(inst.id) + '">');
     h.push('<div class="inst-l1">');
-    h.push('<span class="label">' + esc(inst.label) + "</span>");
+    h.push('<span class="label">' + (prefix ? esc(prefix) + ' <span class="sub">/</span> ' : "") + esc(inst.label) + "</span>");
     if (inst.worktree || inst.slot > 0) { h.push('<span class="badge">worktree</span>'); }
     if (!inst.managed) { h.push('<span class="badge amber" title="detected, not started by portboard">unmanaged</span>'); }
     if (inst.branch) { h.push('<span class="sub mono">' + esc(inst.branch) + "</span>"); }
@@ -687,10 +780,14 @@ td.acts { white-space: nowrap; }
     h.push("</div>");
 
     h.push('<div class="inst-l3">');
+    var startTitle = project.kind === "none" ? ' title="kind none: portboard only observes this one"'
+      : (groupMain ? ' title="starts every service, frontend last"' : "");
+    var stopTitle = groupMain ? ' title="stops every service of the group"' : "";
+    var restartTitle = groupMain ? ' title="restarts every service, frontend last"' : "";
     h.push('<button data-action="start" data-id="' + attr(inst.id) + '"' + (canStart ? "" : " disabled") +
-      (project.kind === "none" ? ' title="kind none: portboard only observes this one"' : "") + ">Start</button>");
-    h.push('<button data-action="stop" data-id="' + attr(inst.id) + '"' + (canStop ? "" : " disabled") + ">Stop</button>");
-    h.push('<button data-action="restart" data-id="' + attr(inst.id) + '"' + (project.kind === "none" ? " disabled" : "") + ">Restart</button>");
+      startTitle + ">Start</button>");
+    h.push('<button data-action="stop" data-id="' + attr(inst.id) + '"' + (canStop ? "" : " disabled") + stopTitle + ">Stop</button>");
+    h.push('<button data-action="restart" data-id="' + attr(inst.id) + '"' + (project.kind === "none" ? " disabled" : "") + restartTitle + ">Restart</button>");
     if (url && running) {
       h.push('<a class="btn" href="' + attr(url) + '" target="_blank" rel="noopener">Open</a>');
     } else {
@@ -710,11 +807,115 @@ td.acts { white-space: nowrap; }
     return h.join("");
   }
 
+  // One line per child main instance inside a group card. The buttons carry
+  // the CHILD instance id: the generic data-action handlers only ever POST to
+  // /api/instances/<data-id>/..., so they work outside the card's own project.
+  function servicesHtml(project, inst) {
+    var services = inst.services || [];
+    var h = [];
+    h.push('<div class="services">');
+    h.push('<div class="svc-head">Services</div>');
+    if (services.length === 0) {
+      h.push('<div class="sub">no sub-projects registered in this group yet</div>');
+      h.push("</div>");
+      return h.join("");
+    }
+    var primaryId = project.primary_child_id;
+    services.forEach(function (s) {
+      var running = s.state === "running";
+      var drift = s.actual_port && s.port && s.actual_port !== s.port;
+      var url = s.url || null;
+      h.push('<div class="svc" data-instance="' + attr(s.id) + '">');
+      h.push('<span class="name">' + esc(s.project || s.label) + "</span>");
+      if (primaryId !== null && primaryId !== undefined && String(s.project_id) === String(primaryId)) {
+        h.push('<span class="badge primary" title="the group card shows the port and state of this child">primary</span>');
+      }
+      if (!s.managed) { h.push('<span class="badge amber" title="detected, not started by portboard">unmanaged</span>'); }
+      if (s.port) { h.push('<span class="port">:' + esc(s.port) + "</span>"); }
+      if (drift) { h.push('<span class="drift" title="reconcile saw a different port">actual ' + esc(s.actual_port) + "</span>"); }
+      h.push(statePill(s.state));
+      h.push('<span class="spacer"></span>');
+      h.push('<span class="svc-acts">');
+      h.push('<button class="tiny" data-action="start" data-id="' + attr(s.id) + '"' +
+        (running || s.state === "starting" || s.kind === "none" ? " disabled" : "") +
+        (s.kind === "none" ? ' title="kind none: portboard only observes this one"' : "") + ">Start</button>");
+      h.push('<button class="tiny" data-action="stop" data-id="' + attr(s.id) + '"' +
+        (s.state === "stopped" ? " disabled" : "") + ">Stop</button>");
+      h.push('<button class="tiny" data-action="logs" data-id="' + attr(s.id) + '">' +
+        (openLogs[s.id] !== undefined ? "Hide logs" : "Logs") + "</button>");
+      if (url && running) {
+        h.push('<a class="btn tiny" href="' + attr(url) + '" target="_blank" rel="noopener">Open</a>');
+      } else {
+        h.push('<a class="btn tiny off" aria-disabled="true" tabindex="-1" title="' +
+          (url ? "not running" : "no url for this service") + '">Open</a>');
+      }
+      h.push("</span>");
+      h.push("</div>");
+      if (openLogs[s.id] !== undefined) {
+        h.push('<pre class="logs" tabindex="0">' + esc(openLogs[s.id] || "(empty)") + "</pre>");
+      }
+    });
+
+    var total = inst.services_total === undefined ? services.length : Number(inst.services_total);
+    var runningCount = inst.services_running === undefined
+      ? services.filter(function (s) { return s.state === "running"; }).length
+      : Number(inst.services_running);
+    var others = services.filter(function (s) {
+      return s.state === "running" && (s.actual_port || s.port) &&
+        !(primaryId !== null && primaryId !== undefined && String(s.project_id) === String(primaryId));
+    }).map(function (s) { return ":" + (s.actual_port || s.port); });
+    var sum = esc(runningCount + " of " + total + " service" + (total === 1 ? "" : "s") + " running");
+    if (others.length) {
+      sum += ' · also listening on <span class="port">' + esc(others.join(", ")) + "</span>";
+    }
+    h.push('<div class="svc-sum">' + sum + "</div>");
+    h.push("</div>");
+    return h.join("");
+  }
+
+  // Worktree instances of the children, listed in the group card so the whole
+  // multi-repo app stays in one place.
+  function childInstancesHtml(project) {
+    var rows = [];
+    childrenOf(project).forEach(function (kid) {
+      var kidHit = matchesFilter(kid, null);
+      (kid.instances || []).forEach(function (inst) {
+        if (!inst.slot) { return; }
+        if (!kidHit && !matchesFilter(kid, inst)) { return; }
+        rows.push(instanceHtml(kid, inst, kid.name));
+      });
+    });
+    if (rows.length === 0) { return ""; }
+    return '<div class="child-insts"><div class="child-head">Worktrees of the services</div>' +
+      '<div class="insts">' + rows.join("") + "</div></div>";
+  }
+
   function editFormHtml(project) {
     function opt(list, current) {
       return list.map(function (v) {
         return '<option value="' + attr(v) + '"' + (v === current ? " selected" : "") + ">" + esc(v) + "</option>";
       }).join("");
+    }
+    if (isGroup(project)) {
+      var kids = childrenOf(project);
+      var current = project.primary_child_id;
+      var options = '<option value="">(pick a child)</option>' + kids.map(function (kid) {
+        return '<option value="' + attr(kid.id) + '"' +
+          (String(kid.id) === String(current) ? " selected" : "") + ">" + esc(kid.name) +
+          (kid.base_port ? " :" + esc(kid.base_port) : "") + "</option>";
+      }).join("");
+      return '<form class="inline" data-form="edit-project" data-id="' + attr(project.id) + '">' +
+        '<div class="row">' +
+          '<label style="flex:2 1 220px"><span>primary (the child this card shows)</span>' +
+            '<select name="primary_child">' + options + "</select></label>" +
+          '<label><span>open_path</span><input type="text" name="open_path" class="mono" value="' + attr(project.open_path || "/") + '"></label>' +
+          '<label><span>autostart</span><select name="autostart">' + opt(["schedule", "never"], project.autostart) + "</select></label>" +
+        "</div>" +
+        '<label class="full"><span>notes</span><input type="text" name="notes" value="' + attr(project.notes || "") + '"></label>' +
+        '<div class="row" style="justify-content:flex-end">' +
+          '<button type="button" data-action="cancel-edit" data-id="' + attr(project.id) + '">Cancel</button>' +
+          '<button type="submit" class="primary">Save project</button>' +
+        "</div></form>";
     }
     return '<form class="inline" data-form="edit-project" data-id="' + attr(project.id) + '">' +
       '<label class="full"><span>start_cmd</span><input type="text" name="start_cmd" class="mono" value="' + attr(project.start_cmd || "") + '"></label>' +
@@ -736,14 +937,26 @@ td.acts { white-space: nowrap; }
     var projectHit = matchesFilter(project, null);
     var shown = projectHit ? instances : instances.filter(function (i) { return matchesFilter(project, i); });
     if (!projectHit && shown.length === 0) { return ""; }
-    var anyRunning = instances.some(function (i) { return i.state === "running" || i.state === "starting"; });
+    var anyRunning = isActiveProject(project);
+
+    var group = isGroup(project);
+    var main = mainInstance(project);
 
     var h = [];
     h.push('<article class="card" data-project="' + attr(project.id) + '">');
     h.push("<header>");
     h.push("<h3>" + esc(project.name) + "</h3>");
-    h.push('<span class="badge' + (project.kind === "none" ? "" : " accent") + '">' + esc(project.kind) + "</span>");
-    if (project.base_port) { h.push('<span class="badge">base :' + esc(project.base_port) + "</span>"); }
+    h.push('<span class="badge' + (project.kind === "none" || group ? "" : " accent") + '">' + esc(project.kind) + "</span>");
+    if (group) {
+      // a group has no base_port of its own: show the primary child's port
+      var groupPort = main && (main.port || main.actual_port);
+      if (groupPort) {
+        h.push('<span class="badge" title="' + attr("port of the primary service" + (project.primary ? " " + project.primary : "")) +
+          '">:' + esc(groupPort) + "</span>");
+      }
+    } else if (project.base_port) {
+      h.push('<span class="badge">base :' + esc(project.base_port) + "</span>");
+    }
     h.push('<span class="spacer"></span>');
     h.push('<span class="grip" draggable="true" tabindex="0" role="button" data-drag-id="' + attr(project.id) +
       '" title="drag to reorder (arrow keys work too)" aria-label="reorder ' + attr(project.name) + '">&#10303;</span>');
@@ -762,17 +975,30 @@ td.acts { white-space: nowrap; }
     }
     h.push("</div>");
 
+    if (group && main) {
+      h.push(servicesHtml(project, main));
+      h.push(childInstancesHtml(project));
+    }
+
     if (openEdit[project.id]) { h.push(editFormHtml(project)); }
 
-    h.push('<form class="inline" data-form="add-instance" data-id="' + attr(project.id) + '">' +
-      '<label style="flex:1 1 auto"><span>add worktree instance (label or absolute path)</span>' +
-      '<input type="text" name="label" class="mono" placeholder="fix-login-timeout" autocomplete="off"></label>' +
-      '<button type="submit" style="align-self:flex-end">Add</button></form>');
+    // a group directory is not a git checkout: no worktree instances on it
+    if (!group) {
+      h.push('<form class="inline" data-form="add-instance" data-id="' + attr(project.id) + '">' +
+        '<label style="flex:1 1 auto"><span>add worktree instance (label or absolute path)</span>' +
+        '<input type="text" name="label" class="mono" placeholder="fix-login-timeout" autocomplete="off"></label>' +
+        '<button type="submit" style="align-self:flex-end">Add</button></form>');
+    }
 
     h.push('<div class="card-foot">');
     h.push('<button data-action="edit" data-id="' + attr(project.id) + '">' + (openEdit[project.id] ? "Close edit" : "Edit") + "</button>");
     h.push('<span class="spacer"></span>');
-    h.push('<span class="sub">' + esc(instances.length) + " instance" + (instances.length === 1 ? "" : "s") + "</span>");
+    if (group) {
+      var svcCount = groupServices(project).length;
+      h.push('<span class="sub">' + esc(svcCount) + " service" + (svcCount === 1 ? "" : "s") + "</span>");
+    } else {
+      h.push('<span class="sub">' + esc(instances.length) + " instance" + (instances.length === 1 ? "" : "s") + "</span>");
+    }
     h.push('<button class="danger" data-action="delete-project" data-id="' + attr(project.id) + '" data-name="' + attr(project.name) + '"' +
       (anyRunning ? ' disabled title="stop the running instances first"' : "") + ">Delete</button>");
     h.push("</div>");
@@ -781,7 +1007,15 @@ td.acts { white-space: nowrap; }
   }
 
   function isActiveProject(p) {
-    return (p.instances || []).some(function (i) { return i.state === "running" || i.state === "starting"; });
+    var live = function (i) { return i.state === "running" || i.state === "starting"; };
+    if ((p.instances || []).some(live)) { return true; }
+    if (isGroup(p)) {
+      // a group is active as soon as ANY of its services runs, even when the
+      // primary child (the instance the card mirrors) is down
+      if (groupServices(p).some(live)) { return true; }
+      return childrenOf(p).some(function (kid) { return (kid.instances || []).some(live); });
+    }
+    return false;
   }
 
   function manualOrder(a, b) {
@@ -790,8 +1024,9 @@ td.acts { white-space: nowrap; }
   }
 
   function displayedProjects(state) {
-    // active projects first, then the manual order (▲▼ on the card), then name
-    return ((state && state.projects) || []).slice().sort(function (a, b) {
+    // only top-level cards: children of a group are drawn inside its card
+    // active projects first, then the manual order (drag grip), then name
+    return topLevelProjects(state).slice().sort(function (a, b) {
       return ((isActiveProject(b) ? 1 : 0) - (isActiveProject(a) ? 1 : 0)) || manualOrder(a, b);
     });
   }
@@ -911,14 +1146,18 @@ td.acts { white-space: nowrap; }
     q("#projects").innerHTML = cards.join("") || '<div class="empty">' +
       (filterText ? "nothing matches the filter" : "no projects yet — use Register project") + "</div>";
     var running = 0;
-    projects.forEach(function (p) {
+    // count every project's instances, groups excluded: their main instance
+    // only mirrors a child that is counted already
+    ((state && state.projects) || []).forEach(function (p) {
+      if (isGroup(p)) { return; }
       (p.instances || []).forEach(function (i) { if (i.state === "running") { running++; } });
     });
     q("#projects-count").textContent = visible + "/" + projects.length + " shown · " + running + " running";
   }
 
   function projectOptions(state, selected) {
-    return ((state && state.projects) || []).map(function (p) {
+    // a group owns no port itself: a listener is adopted into a real project
+    return ((state && state.projects) || []).filter(function (p) { return !isGroup(p); }).map(function (p) {
       return '<option value="' + attr(p.id) + '"' + (String(p.id) === String(selected) ? " selected" : "") + ">" + esc(p.name) + "</option>";
     }).join("");
   }
@@ -1056,9 +1295,20 @@ td.acts { white-space: nowrap; }
     q("#backdrop").classList.remove("open");
   }
 
+  // kind 'group' has no start command and no port of its own (the children
+  // carry both), so those fields are hidden while it is selected
+  function syncRegisterKind() {
+    var form = q("#register-form");
+    if (!form) { return; }
+    var isGroupKind = form.elements.kind.value === "group";
+    q("#reg-start-cmd").classList.toggle("hidden", isGroupKind);
+    q("#reg-ports").classList.toggle("hidden", isGroupKind);
+  }
+
   function openRegister() {
     var form = q("#register-form");
     form.reset();
+    syncRegisterKind();
     q("#suggestion").textContent = "";
     q("#backdrop").classList.add("open");
     q("#register").classList.add("open");
@@ -1241,6 +1491,7 @@ td.acts { white-space: nowrap; }
           ["name", "kind", "start_cmd", "port_mode", "base_port"].forEach(function (k) {
             if (s[k] !== undefined && s[k] !== null && form.elements[k]) { form.elements[k].value = s[k]; }
           });
+          syncRegisterKind();
           var ev = (s.evidence || []).map(function (e) { return "• " + esc(e); }).join("<br>");
           q("#suggestion").innerHTML = "<b>Suggestion</b>" +
             (s.confidence !== undefined ? " (confidence " + esc(s.confidence) + ")" : "") + (ev ? "<br>" + ev : "");
@@ -1317,14 +1568,16 @@ td.acts { white-space: nowrap; }
     if (kind === "edit-project") {
       var id = form.getAttribute("data-id");
       var f = form.elements;
+      // a group form has no start_cmd / port fields, but it has `primary`
       var patch = {
-        start_cmd: f.start_cmd.value.trim() || null,
-        port_mode: f.port_mode.value,
-        base_port: f.base_port.value ? Number(f.base_port.value) : null,
         open_path: f.open_path.value.trim() || "/",
         autostart: f.autostart.value,
         notes: f.notes.value.trim() || null
       };
+      if (f.start_cmd) { patch.start_cmd = f.start_cmd.value.trim() || null; }
+      if (f.port_mode) { patch.port_mode = f.port_mode.value; }
+      if (f.base_port) { patch.base_port = f.base_port.value ? Number(f.base_port.value) : null; }
+      if (f.primary_child) { patch.primary_child = f.primary_child.value ? Number(f.primary_child.value) : null; }
       run(btn, function () {
         return api.patch("/api/projects/" + id, patch).then(function (p) { openEdit[id] = false; return p; });
       }, "project saved");
@@ -1349,6 +1602,9 @@ td.acts { white-space: nowrap; }
   });
 
   wireDrag(q("#projects"));
+
+  q("#register-form").elements.kind.addEventListener("change", syncRegisterKind);
+  syncRegisterKind();
 
   q("#ports-projects-only").addEventListener("change", function (ev) {
     portsProjectsOnly = !!ev.target.checked;

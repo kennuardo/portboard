@@ -258,6 +258,78 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(self.run_reconcile()["matched"], 1)
         self.assertEqual(self.instance(2)["state"], "running")
 
+    # --------------------------------------------------- kind='container'
+    def add_container_project(self, pid_, name, start_cmd, base_port):
+        ts = db.now()
+        self.conn.execute(
+            "INSERT INTO projects(id, name, path, kind, start_cmd, port_mode, base_port,"
+            " slots, created_at, updated_at) VALUES (?, ?, ?, 'container', ?, 'fixed', ?, 9, ?, ?)",
+            (pid_, name, str(self.tmp / name), start_cmd, base_port, ts, ts))
+
+    def test_hand_started_container_matches_the_instance_by_name(self):
+        self.add_container_project(2, "rma-admin-app", "rma-admin", 3100)
+        # nobody here started it: unit is NULL, only the name is derivable
+        self.add_instance(3, "main", 0, str(self.tmp / "rma-admin-app"), 3100,
+                          project_id=2)
+        cid = "c" * 64
+        self.containers = [container("rma-admin", cid=cid, network="host", pid=900)]
+        self.listeners = [listener(3100, pid=900, comm="node")]
+        self.procs = {900: proc(900, cwd="/app", container=cid[:12], comm="node")}
+
+        summary = self.run_reconcile()
+
+        self.assertEqual(summary["matched"], 1)
+        inst = self.instance(3)
+        self.assertEqual((inst["state"], inst["actual_port"], inst["pid"]),
+                         ("running", 3100, 900))
+        # not started by us: unmanaged, and the container is remembered as its unit
+        self.assertEqual((inst["managed"], inst["unit"]), (0, "rma-admin"))
+        self.assertEqual(self.observed(3100)["instance_id"], 3)
+
+    def test_hand_started_container_matches_a_worktree_by_suffix(self):
+        self.add_container_project(2, "rma-admin-app", "rma-admin", 3100)
+        self.add_instance(3, "main", 0, str(self.tmp / "rma-admin-app"), 3100, project_id=2)
+        self.add_instance(4, "csv-attributes", 1,
+                          str(self.tmp / "rma-admin-app" / ".claude" / "worktrees" / "csv-attributes"),
+                          3101, project_id=2)
+        cid = "d" * 64
+        self.containers = [container("rma-admin-csv-attributes", cid=cid, network="host", pid=901)]
+        self.listeners = [listener(3101, pid=901, comm="node")]
+        self.procs = {901: proc(901, cwd="/app", container=cid[:12], comm="node")}
+
+        self.run_reconcile()
+
+        self.assertEqual(self.instance(4)["state"], "running")
+        self.assertEqual(self.instance(3)["state"], "stopped")
+
+    def test_container_started_by_portboard_keeps_its_managed_flag(self):
+        self.add_container_project(2, "rma-admin-app", "rma-admin", 3100)
+        # the runner recorded the unit before waiting: this one is ours
+        self.add_instance(3, "main", 0, str(self.tmp / "rma-admin-app"), 3100,
+                          project_id=2, unit="rma-admin", state="starting")
+        cid = "e" * 64
+        self.containers = [container("rma-admin", cid=cid, network="host", pid=902)]
+        self.listeners = [listener(3100, pid=902, comm="node")]
+        self.procs = {902: proc(902, cwd="/app", container=cid[:12], comm="node")}
+
+        self.run_reconcile()
+
+        inst = self.instance(3)
+        self.assertEqual((inst["state"], inst["managed"], inst["unit"]),
+                         ("running", 1, "rma-admin"))
+
+    def test_group_instance_is_never_marked_crashed(self):
+        ts = db.now()
+        self.conn.execute(
+            "INSERT INTO projects(id, name, path, kind, port_mode, slots, created_at, updated_at)"
+            " VALUES (3, 'rma', ?, 'group', 'none', 9, ?, ?)", (str(self.tmp / "rma"), ts, ts))
+        # the mirror can leave the stored row at 'running'; it has no listener
+        self.add_instance(5, "main", 0, str(self.tmp / "rma"), None,
+                          project_id=3, state="running")
+        summary = self.run_reconcile()
+        self.assertNotIn(5, summary["stopped"])
+        self.assertEqual(self.instance(5)["state"], "running")
+
     def test_quick_skips_docker(self):
         self.listeners = []
         summary = self.run_reconcile(quick=True)

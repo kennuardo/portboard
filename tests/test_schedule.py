@@ -463,5 +463,52 @@ class TestNotify(ScheduleTestCase):
         self.assertIn("demo@main", message)
 
 
+# --------------------------------------------------------------------------
+# groups: the schedule works on the children, never on the group row
+# --------------------------------------------------------------------------
+
+class TestGroups(ScheduleTestCase):
+    def setUp(self):
+        super().setUp()
+        self.group = self.add_project("rma", kind="group", start_cmd=None,
+                                      port_mode="none")
+        # the group's instance view mirrors the primary child, so it looks running
+        self.group_instance = self.add_instance(self.group, port=None, state="running")
+        self.child = self.add_project("rma-api", parent_id=self.group["id"])
+        self.child_instance = self.add_instance(self.child, port=4200)
+
+    def test_evening_stop_skips_the_group_and_stops_the_child(self):
+        with mock.patch.object(runner, "stop") as stop:
+            result = schedule.evening_stop(self.conn)
+        self.assertEqual([c.args[1] for c in stop.call_args_list],
+                         [self.child_instance["id"]])
+        reasons = {i["id"]: i.get("reason") for i in result["skipped"]}
+        self.assertEqual(reasons[self.group_instance["id"]], schedule.GROUP_REASON)
+        self.assertEqual(self.remembered()["ids"], [self.child_instance["id"]])
+
+    def test_tick_never_idle_stops_a_group(self):
+        db.set_setting(self.conn, "idle_minutes", "10")
+        self.conn.execute("UPDATE instances SET idle_since = ? WHERE id IN (?, ?)",
+                          (ago(600), self.group_instance["id"], self.child_instance["id"]))
+        with mock.patch.object(runner, "status_many", return_value={}), \
+                mock.patch.object(runner, "stop") as stop:
+            result = schedule.tick(self.conn)
+        self.assertEqual([c.args[1] for c in stop.call_args_list],
+                         [self.child_instance["id"]])
+        reasons = {i["id"]: i.get("reason") for i in result["skipped"]}
+        self.assertEqual(reasons[self.group_instance["id"]], schedule.GROUP_REASON)
+
+    def test_morning_start_only_ever_sees_children(self):
+        db.set_setting(self.conn, schedule.LAST_STOPPED_KEY,
+                       json.dumps({"ts": db.now(), "ids": [self.child_instance["id"]]}))
+        self.registry.update_instance(self.conn, self.child_instance["id"],
+                                      state="stopped", stopped_by="schedule")
+        with mock.patch.object(runner, "start") as start:
+            result = schedule.morning_start(self.conn)
+        self.assertEqual([c.args[1] for c in start.call_args_list],
+                         [self.child_instance["id"]])
+        self.assertEqual([i["id"] for i in result["started"]], [self.child_instance["id"]])
+
+
 if __name__ == "__main__":
     unittest.main()

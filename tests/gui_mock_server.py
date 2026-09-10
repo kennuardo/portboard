@@ -253,7 +253,109 @@ INSTANCES: list[dict] = [
     },
 ]
 
+# --------------------------------------------------------------------------
+# kind 'group': /mnt/hyper/Projects/rma, one app spread over five repos.
+# The group owns no port: its single main instance mirrors the primary child
+# (rma-admin-app :3100) and carries `services`, one main instance per child.
+# --------------------------------------------------------------------------
+
+
+def _rma_child(pid: int, name: str, kind: str, port: int, start_cmd=None,
+               port_mode: str = "fixed", notes=None) -> dict:
+    return {
+        "id": pid, "name": name,
+        "path": "/mnt/hyper/Projects/rma/" + name[len("rma-"):],
+        "kind": kind, "start_cmd": start_cmd, "stop_cmd": None,
+        "port_mode": port_mode, "base_port": port, "slots": 9,
+        "health_path": "/", "open_path": "/", "pinned": 0, "autostart": "schedule",
+        "env_json": "{}", "path_prepend": None, "memory_max": None,
+        "source": "discover", "notes": notes, "parent_id": 4, "primary_child": None,
+        "created_at": ago(days=6), "updated_at": ago(hours=2),
+    }
+
+
+PROJECTS += [
+    {
+        "id": 4, "name": "rma", "path": "/mnt/hyper/Projects/rma", "kind": "group",
+        "start_cmd": None, "stop_cmd": None, "port_mode": "none", "base_port": None,
+        "slots": 1, "health_path": "/", "open_path": "/", "pinned": 0,
+        "autostart": "schedule", "env_json": "{}", "path_prepend": None,
+        "memory_max": None, "source": "discover",
+        "notes": "multi-repo app: two front ends, an api, mariadb and a mail catcher",
+        "parent_id": None, "primary_child": None,
+        "created_at": ago(days=6), "updated_at": ago(hours=2),
+    },
+    _rma_child(5, "rma-mariadb", "container", 3306, start_cmd="rma-mariadb",
+               notes="existing docker container, started by name"),
+    _rma_child(6, "rma-mailpit", "container", 8025, start_cmd="rma-mailpit"),
+    _rma_child(7, "rma-server-side", "transient", 8080,
+               start_cmd="./mvnw quarkus:dev -Dquarkus.http.port={port}", port_mode="arg"),
+    _rma_child(8, "rma-customer-app", "none", 3101, notes="observed only for now"),
+    _rma_child(9, "rma-admin-app", "transient", 3100, start_cmd="npm run dev", port_mode="env",
+               notes="the primary: the group card shows this port and state"),
+]
+
+
+def _rma_instance(iid: int, project_id: int, port, label: str = "main", slot: int = 0,
+                  state: str = "stopped", unit=None, path=None, branch="main") -> dict:
+    proj = next(p for p in PROJECTS if p["id"] == project_id)
+    running = state == "running"
+    return {
+        "id": iid, "project_id": project_id, "label": label, "slot": slot,
+        "path": path or proj["path"], "branch": branch, "port": port,
+        "unit": unit, "managed": 0 if proj["kind"] == "none" else 1,
+        "state": state, "pid": 40000 + iid if running else None,
+        "actual_port": port if running else None,
+        "owner_session": None, "owner_seen_at": None,
+        "started_at": ago(hours=2) if running else ago(days=1),
+        "stopped_at": None if running else ago(hours=13),
+        "stopped_by": None if running else "schedule",
+        "last_seen_at": ago(minutes=1) if running else ago(hours=13),
+        "mem_bytes": 210 * 1024 * 1024 if running else None,
+        "cpu_ns": 8 * 10 ** 9 if running else 1 * 10 ** 9,
+        "cpu_checked_at": ago(minutes=1), "idle_since": None, "extra_json": "{}",
+        "created_at": ago(days=6), "updated_at": ago(minutes=1),
+    }
+
+
+INSTANCES += [
+    _rma_instance(6, 5, 3306, state="running", unit="docker-rma-mariadb.scope"),
+    _rma_instance(7, 6, 8025, state="running", unit="docker-rma-mailpit.scope"),
+    _rma_instance(8, 7, 8080, state="running", unit="portboard-rma-server-side-main.service"),
+    _rma_instance(9, 8, 3101),
+    _rma_instance(10, 9, 3100, unit="portboard-rma-admin-app-main.service"),
+    _rma_instance(11, 4, None, unit=None),          # the group's mirror instance
+    _rma_instance(12, 9, 3102, label="csv-attributes", slot=1,
+                  path="/mnt/hyper/Projects/rma/admin-app/.claude/worktrees/csv-attributes",
+                  branch="worktree-csv-attributes",
+                  unit="portboard-rma-admin-app-csv-attributes.service"),
+]
+
 OBSERVED: list[dict] = [
+    {
+        "port": 3306, "proto": "tcp", "bind": "0.0.0.0", "pid": 40006,
+        "comm": "docker-proxy", "cwd": None,
+        "cmdline": "/usr/bin/docker-proxy -proto tcp -host-port 3306",
+        "unit": "docker.service", "container": "rma-mariadb",
+        "compose_project": None, "compose_workdir": "/mnt/hyper/Projects/rma/mariadb",
+        "project_id": 5, "instance_id": 6, "seen_at": ago(minutes=1),
+    },
+    {
+        "port": 8025, "proto": "tcp", "bind": "0.0.0.0", "pid": 40007,
+        "comm": "docker-proxy", "cwd": None,
+        "cmdline": "/usr/bin/docker-proxy -proto tcp -host-port 8025",
+        "unit": "docker.service", "container": "rma-mailpit",
+        "compose_project": None, "compose_workdir": "/mnt/hyper/Projects/rma/mailpit",
+        "project_id": 6, "instance_id": 7, "seen_at": ago(minutes=1),
+    },
+    {
+        "port": 8080, "proto": "tcp", "bind": "127.0.0.1", "pid": 40008,
+        "comm": "java", "cwd": "/mnt/hyper/Projects/rma/server-side",
+        "cmdline": "java -jar quarkus-run.jar",
+        "unit": "portboard-rma-server-side-main.service", "container": None,
+        "compose_project": None, "compose_workdir": None,
+        "project_id": 7, "instance_id": 8, "seen_at": ago(minutes=1),
+    },
     {
         "port": 3300, "proto": "tcp", "bind": "127.0.0.1", "pid": 214233,
         "comm": "node", "cwd": "/mnt/hyper/Projects/sheron-world",
@@ -387,6 +489,70 @@ def instance_by_id(iid):
     return next((i for i in INSTANCES if i["id"] == iid), None)
 
 
+def children_of(group_id) -> list[dict]:
+    """Child projects of a group, in display order (the fixture order)."""
+    return [p for p in PROJECTS if p.get("parent_id") == group_id]
+
+
+def main_instance_of(project_id):
+    return next((i for i in INSTANCES if i["project_id"] == project_id and i["slot"] == 0), None)
+
+
+def pick_primary(group: dict):
+    """Explicit primary_child, else the front end a human would open."""
+    kids = children_of(group["id"])
+    if group.get("primary_child"):
+        explicit = next((k for k in kids if k["id"] == int(group["primary_child"])), None)
+        if explicit:
+            return explicit
+    if not kids:
+        return None
+    return sorted(kids, key=lambda k: (0 if k["kind"] not in ("container", "none") else 1,
+                                       k.get("base_port") or 99_999, k["name"]))[0]
+
+
+def decorate(project: dict) -> dict:
+    """Project row plus the computed group fields registry._decorate() adds."""
+    row = dict(project)
+    row.setdefault("parent_id", None)
+    row.setdefault("primary_child", None)
+    parent = project_by_id(row["parent_id"]) if row["parent_id"] is not None else None
+    row["parent"] = parent["name"] if parent else None
+    if row.get("kind") == "group":
+        kids = children_of(row["id"])
+        row["children"] = [k["id"] for k in kids]
+        row["child_names"] = [k["name"] for k in kids]
+        primary = pick_primary(row)
+        row["primary_child_id"] = primary["id"] if primary else None
+        row["primary"] = primary["name"] if primary else None
+    return row
+
+
+_MIRRORED = ("state", "port", "actual_port", "url", "pid", "started_at", "stopped_at",
+             "stopped_by", "mem_bytes", "cpu_ns", "idle_since", "unit", "managed")
+
+
+def mirror_primary(view: dict, group: dict) -> None:
+    """A group's main instance shows its primary child's main instance, plus
+    ``services`` (every child's main instance, display order) for the GUI."""
+    group = decorate(group)
+    services = []
+    for kid in children_of(group["id"]):
+        main = main_instance_of(kid["id"])
+        if main is not None:
+            services.append(inst_json(main))
+    view["services"] = services
+    view["primary"] = group.get("primary")
+    view["services_running"] = sum(1 for s in services if s["state"] == "running")
+    view["services_total"] = len(services)
+    primary = next((s for s in services if s["project_id"] == group.get("primary_child_id")), None)
+    if primary is None:
+        return
+    for key in _MIRRORED:
+        view[key] = primary.get(key)
+    view["primary_instance_id"] = primary["id"]
+
+
 def inst_json(inst: dict) -> dict:
     """Instance row plus the computed fields the API contract promises."""
     proj = project_by_id(inst["project_id"]) or {}
@@ -396,18 +562,21 @@ def inst_json(inst: dict) -> dict:
     out["kind"] = proj.get("kind")
     out["pinned"] = proj.get("pinned", 0)
     out["worktree"] = inst.get("slot", 0) > 0
+    out["parent"] = decorate(proj).get("parent") if proj else None
     out["url"] = (
         f"http://localhost:{port}{proj.get('open_path', '/')}"
         if port and inst.get("state") == "running" and proj.get("port_mode") != "none"
         else None
     )
+    if proj.get("kind") == "group" and not inst.get("slot"):
+        mirror_primary(out, proj)
     return out
 
 
 def state_json() -> dict:
     projects = []
     for p in PROJECTS:
-        row = dict(p)
+        row = decorate(p)
         row["instances"] = [inst_json(i) for i in INSTANCES if i["project_id"] == p["id"]]
         row["instances"].sort(key=lambda i: i["slot"])
         projects.append(row)
@@ -432,8 +601,44 @@ def observed_for_instance(inst: dict) -> dict | None:
     return next((o for o in OBSERVED if o.get("instance_id") == inst["id"]), None)
 
 
+def group_start_order(group: dict) -> list[dict]:
+    """Children in start order: display order with the primary (the front end)
+    moved last, so the backing services are up before it boots."""
+    kids = children_of(group["id"])
+    primary = pick_primary(group)
+    if primary is None:
+        return kids
+    return [k for k in kids if k["id"] != primary["id"]] + [primary]
+
+
+def do_group_start(inst: dict, group: dict) -> dict:
+    started = []
+    for kid in group_start_order(group):
+        main = main_instance_of(kid["id"])
+        if main is None or kid["kind"] == "none" or main["state"] == "running":
+            continue
+        do_start(main)
+        started.append(kid["name"])
+    event("group.start", {"started": started, "source": "gui"}, group["id"], inst["id"])
+    return inst_json(inst)
+
+
+def do_group_stop(inst: dict, group: dict, reason: str = "user") -> dict:
+    stopped = []
+    for kid in reversed(group_start_order(group)):
+        main = main_instance_of(kid["id"])
+        if main is None or main["state"] == "stopped":
+            continue
+        do_stop(main, reason)
+        stopped.append(kid["name"])
+    event("group.stop", {"stopped": stopped, "reason": reason}, group["id"], inst["id"])
+    return inst_json(inst)
+
+
 def do_start(inst: dict) -> dict:
     proj = project_by_id(inst["project_id"]) or {}
+    if proj.get("kind") == "group" and not inst.get("slot"):
+        return do_group_start(inst, proj)
     if proj.get("kind") == "none":
         raise ApiError(400, "no start command: project kind is 'none'")
     inst.update(
@@ -464,6 +669,9 @@ def do_start(inst: dict) -> dict:
 
 
 def do_stop(inst: dict, reason: str = "user") -> dict:
+    proj = project_by_id(inst["project_id"]) or {}
+    if proj.get("kind") == "group" and not inst.get("slot"):
+        return do_group_stop(inst, proj, reason)
     inst.update(state="stopped", pid=None, actual_port=None, stopped_at=now(),
                 stopped_by=reason, mem_bytes=None, idle_since=None, updated_at=now())
     row = observed_for_instance(inst)
@@ -631,6 +839,17 @@ def route(method: str, path: str, query: dict, body: dict):
             return inst_json(inst)
         if method == "GET" and verb == "logs":
             lines = int((query.get("lines") or ["200"])[0])
+            proj = project_by_id(inst["project_id"]) or {}
+            if proj.get("kind") == "group" and not inst["slot"]:
+                # the group's logs are its children's logs, one block each
+                blocks = []
+                for kid in group_start_order(proj):
+                    main = main_instance_of(kid["id"])
+                    if main is None:
+                        continue
+                    blocks.append(f"===== {kid['name']} =====\n"
+                                  + fake_logs(main, max(1, lines // max(1, len(children_of(proj['id']))))))
+                return {"text": "\n".join(blocks) or "(no services)"}
             return {"text": fake_logs(inst, lines)}
         if method == "DELETE" and not verb:
             if inst["slot"] == 0:
@@ -692,6 +911,8 @@ def route(method: str, path: str, query: dict, body: dict):
         stopped, started, skipped = [], [], []
         for inst in INSTANCES:
             proj = project_by_id(inst["project_id"]) or {}
+            if proj.get("kind") == "group":
+                continue          # the mirror instance: its children are in the loop already
             if proj.get("pinned") or not inst["managed"]:
                 skipped.append(inst["id"])
                 continue

@@ -48,9 +48,51 @@ for the user's `start_cmd`, which is passed to `/bin/sh -c` by systemd-run.
 * **project**: one repository. `path` is the main checkout. `kind` decides how
   the runner works: `transient` (systemd-run of `start_cmd`), `unit` (an
   existing systemd --user unit named in `start_cmd`, e.g. `sheron-dev.service`),
-  `compose` (docker compose in `path`), `none` (we only observe, e.g. containers
-  started by hand). `base_port` is the main checkout's port; worktree slot `n`
-  gets `base_port + n`. `pinned=1` means schedule and idle rule never stop it.
+  `compose` (docker compose in `path`), `container` (an existing docker
+  container named in `start_cmd`, e.g. a hand-made dev stack; worktree
+  instances use `<name>-<label>`), `group` (a directory of sibling
+  sub-projects, e.g. `/mnt/hyper/Projects/rma` holding `admin-app`,
+  `customer-app`, `server-side`; see below), `none` (we only observe).
+  `base_port` is the main checkout's port; worktree slot `n` gets
+  `base_port + n`. `pinned=1` means schedule and idle rule never stop it.
+* **groups** (`kind='group'`): the parent project at the group directory.
+  Children are ordinary projects with `projects.parent_id` set to the group's
+  id; a child registered without an explicit name is called
+  `<group>-<basename>`. Groups are forced to `port_mode='none'`, `base_port =
+  NULL`, `start_cmd = NULL` (registry.add_project/update_project enforce this
+  whenever `kind == 'group'`); they never hold a port or start command of
+  their own. Nested groups are refused (a group cannot itself have
+  `parent_id` set, and a project with `parent_id` cannot have `kind='group'`).
+  `projects.primary_child` optionally names the child whose port/url/state
+  the group's main instance shows; when NULL, `discover.pick_primary` picks
+  one by a name-token heuristic (frontend/web/admin/client/app score highest,
+  api/server/backend/db.../worker/tools score negative; ties broken by
+  lowest port, then name). `registry.get_project`/`list_projects` decorate
+  every project with `parent` (parent name or None) and decorate groups
+  further with `children` (child ids in display order), `child_names`,
+  `primary_child_id` (explicit or heuristic) and `primary` (its name).
+  Helpers: `group_children`, `primary_child`, `group_start_order` (display
+  order with the primary moved last, for starting children frontend-last),
+  `add_group(conn, suggestion, source, allow_busy)` (registers a group plus
+  every child from a `discover.suggest_group()` result in one call; a child
+  whose path is already registered is re-parented rather than duplicated;
+  the primary is taken from `suggestion["primary"]`, a child name).
+  `delete_project` on a group cascades to its children. A group's main
+  **instance** is a view, not a stored row: it mirrors the primary child's
+  main instance (`state`, `port`, `actual_port`, `url`, `pid`, `started_at`,
+  `stopped_at`, `stopped_by`, `mem_bytes`, `cpu_ns`, `idle_since`, `unit`,
+  `managed`) and adds `services` (every child's main instance view, display
+  order), `primary`, `primary_instance_id`, `services_running`,
+  `services_total`. The underlying `instances` row for the group (slot 0,
+  port NULL) is never written to by this mirroring — only computed on read.
+  `resolve_path` returns `Resolved.group` (the decorated parent group dict)
+  for any path inside a child; a path inside the group directory but outside
+  every child resolves to the group project itself (`group=None` on that
+  result, since the group has no parent of its own). Export writes `parent`
+  and `primary` as names, not ids, and orders groups before their children so
+  import can resolve `parent` by name in one pass (a second pass resolves
+  `primary`, since a child may be created after its group in the same
+  import).
 * **instance**: one running location of a project: label `main` (slot 0, path =
   project.path) or a worktree slug (slot 1..slots, path =
   `<project.path>/.claude/worktrees/<slug>`). `managed=0` marks instances we
@@ -94,7 +136,9 @@ Timestamps are local ISO strings from `db.now()`.
 for any absolute path: walk up from `path` until a directory equals a
 `projects.path` or matches `<projects.path>/.claude/worktrees/<slug>`. Worktree
 paths map to label `slug`; anything else inside the project maps to `main`.
-Symlinks are resolved with `os.path.realpath` on both sides.
+Symlinks are resolved with `os.path.realpath` on both sides. `Resolved.group`
+carries the decorated `kind='group'` parent when `project` is a child of one
+(None otherwise, including for the group project itself).
 
 ## Runner contract (runner.py)
 
@@ -125,6 +169,20 @@ unit_name(project, instance) -> str            # portboard-<project>-<label>.ser
 * `none`: start raises `RunnerError("no start command")`; stop tries
   `docker stop <container>` when observed knows the container, else SIGTERM to
   the pid's process group, else error.
+* `container`: `start_cmd` is the docker container name (`<name>-<label>` for
+  worktree instances). start: `docker start <name>`; stop: `docker stop
+  <name>`; logs: `docker logs --tail <lines> <name>`; wait (when `wait=True`)
+  matches by container id/name via `sysinfo.docker_containers()` rather than
+  by cgroup, since the container is not something we `systemd-run`.
+* `group`: start runs `start()` on every child in
+  `registry.group_start_order(conn, group)` order (display order, primary
+  last, so the frontend a human opens comes up once its dependencies are
+  already listening); children with `kind='none'` are skipped (no start
+  command). Stop runs the children in reverse order. `logs` concatenates each
+  child's logs, headed by the child's name. The group's own `instances` row
+  (slot 0) is never written by the runner — its view is always the live
+  mirror computed by `registry._instance_view`/`_mirror_primary`, so there is
+  nothing to start/stop/reconcile for the group row itself.
 * After start with `wait=True`: poll `sysinfo.listening_ports()` every 0.5 s up
   to `settings.start_timeout` seconds until something owned by the unit's
   cgroup (transient/unit) or the compose project listens; record `actual_port`,
@@ -163,7 +221,13 @@ reconcile.reconcile(conn, quick=False) -> dict   # summary: {listeners, matched,
   `quick=True` skips docker entirely (used by hooks to stay under 300 ms).
 * Matching order per listener: instance whose `unit` equals the pid's unit or
   container/compose project; else instance/project by path prefix of `cwd` or
-  `compose_workdir`; else unknown.
+  `compose_workdir`; else unknown. `kind='container'` instances are matched
+  purely by container name (`instances.unit` = the container name), never by
+  `cwd`/path prefix, since a hand-made container's working directory has no
+  reliable relationship to the project path. `kind='group'` projects are
+  never matched or written to directly — reconcile only ever touches their
+  children's instance rows; the group's own row does not exist to reconcile
+  against (see Runner contract above).
 * Effects: rewrite `observed`; for matched instances set `state=running`,
   `pid`, `actual_port`, `last_seen_at`; for managed instances previously
   `running` but no longer seen set `state=stopped`, `stopped_by='crash'` unless
@@ -190,6 +254,14 @@ When `settings.notify_on_schedule == "1"` pipe a one-paragraph Slovak summary
 to `python3 ~/.claude/hooks/notify-hermes.py` (stdin JSON `{"message": ...}`),
 best effort, timeout 10 s.
 
+`kind='group'` instances (there is no real instance row for a group, see
+Runner contract) are skipped by both `evening_stop`/`morning_start` and the
+`tick` idle rule — iterate `projects` in both by kind, filtering out `group`
+before touching instances. Their children are ordinary managed instances and
+are stopped/started/idle-checked individually like any other project; a
+child being pinned or unpinned is independent of its siblings and of the
+group.
+
 ## HTTP API (server.py)
 
 Bound to `127.0.0.1:<daemon_port>` or inherited from systemd socket activation
@@ -207,8 +279,14 @@ GET  /api/state                {projects:[{..., instances:[...]}], observed:[...
 POST /api/reconcile            {"quick": false, "adopt_unknown": false} -> same as /api/state
 GET  /api/events?limit=100     [...]
 POST /api/projects             project fields -> project
+                                kind=group: fields must be a discover.suggest_group()-shaped
+                                body (children, primary) -> registry.add_group(); anything
+                                else with kind=group is refused (use suggest_group first)
 PATCH /api/projects/<id>       partial fields -> project
-DELETE /api/projects/<id>      {"ok": true}   (stops instances first)
+                                primary_child accepts a child id or name, validated as a
+                                child of that group; parent_id accepts a group id, validated
+                                (not nested, not the project's own id)
+DELETE /api/projects/<id>      {"ok": true}   (stops instances first; a group deletes its children too)
 POST /api/projects/<id>/instances   {"path": "..."} or {"label": "..."} -> instance (worktree slot)
 POST /api/instances/<id>/start      -> instance
 POST /api/instances/<id>/stop       -> instance
@@ -220,7 +298,9 @@ POST /api/observed/<port>/adopt     {"project_id": optional} -> instance
 POST /api/observed/<port>/stop      {"ok": true}
 POST /api/schedule/stop             schedule.evening_stop result
 POST /api/schedule/start            schedule.morning_start result
-GET  /api/discover?path=/abs/dir    discover.suggest(path)
+GET  /api/discover?path=/abs/dir    discover.suggest(path), or discover.suggest_group(path)
+                                     when the path is a group directory (no .git, >=2 recognised
+                                     sibling repos) rather than a repository itself
 POST /api/settings                  {key: value, ...} -> settings
 POST /mcp                           MCP JSON-RPC (see below)
 GET  /mcp                           405
@@ -245,12 +325,12 @@ the caller passes explicitly, the server cannot know it):
 |---|---|---|
 | `ports_list` | | observed + instances, compact |
 | `port_whois` | `port` (required) | observed row + matched project/instance |
-| `project_status` | `cwd` (required) | project, instances, `this` = the instance for cwd if any, assigned port |
-| `project_claim` | `cwd` (required), `session_id` | registers unknown repos via discover, ensures an instance row for cwd (worktree slot if needed), sets owner; returns instance incl. url and a `start_hint` |
-| `instance_start` | `cwd` or `instance_id`, `session_id` | started instance (waits for LISTEN) |
+| `project_status` | `cwd` (required) | project (incl. `parent`/`group` when `cwd` is inside a group's child, and `children`/`services` when `cwd` is the group itself), instances, `this` = the instance for cwd if any, assigned port |
+| `project_claim` | `cwd` (required), `session_id` | registers unknown repos via discover, ensures an instance row for cwd (worktree slot if needed), sets owner; returns instance incl. url and a `start_hint`; a `cwd` inside an as-yet-unregistered group directory registers the whole group via `discover.suggest_group` + `registry.add_group` before claiming |
+| `instance_start` | `cwd` or `instance_id`, `session_id` | started instance (waits for LISTEN); starting a group's instance id starts its children in `group_start_order` |
 | `instance_stop` | `cwd` or `instance_id` | stopped instance |
 | `reconcile` | `quick` | reconcile summary |
-| `project_register` | `path` (required), `name`, `kind`, `start_cmd`, `base_port`, `port_mode` | project |
+| `project_register` | `path` (required), `name`, `kind`, `start_cmd`, `base_port`, `port_mode`, `parent`, `primary` | project; `kind=group` registers via `discover.suggest_group(path)` + `registry.add_group` (ignoring the port/start_cmd fields, which groups never take); `parent` (a group name) registers `path` as a child of that group; `primary` (a child name) is only meaningful together with `kind=group` |
 
 `mcp.py` also provides `stdio_main()` for `portboard mcp-stdio`: newline
 delimited JSON-RPC on stdin/stdout, same handler, as a fallback transport.
@@ -264,7 +344,11 @@ Claude Code. Keep SessionStart under 300 ms: direct DB access, `reconcile(quick=
 * `session-start`: fields `session_id`, `cwd`, `source`. Resolve cwd. Unknown
   git repo that looks like a project (package.json, compose file,
   pyproject.toml, requirements.txt, Makefile with a run target) -> register via
-  discover with `source='hook'`. Ensure an instance row for cwd (main or
+  discover with `source='hook'`. A `cwd` that sits inside a directory
+  `discover.group_of(cwd)` recognises as a group, and that group is not
+  registered yet, auto-registers the whole group (`registry.add_group`,
+  `source='hook'`) before resolving cwd's own project, so the repo the user
+  opened comes up already parented. Ensure an instance row for cwd (main or
   worktree slot). Print plain text to stdout:
 
   ```
@@ -272,6 +356,12 @@ Claude Code. Keep SessionStart under 300 ms: direct DB access, `reconcile(quick=
   assigned port 3301, test URL http://localhost:3301/
   running: main@3300 (unit sheron-dev.service, since 09:12, owner none); fix-login@3301 not running
   start it with the MCP tool instance_start (cwd=...) or: portboard start --cwd .
+  ```
+  When `resolve_path` reports a `group` for cwd's project, print an extra
+  line naming it and the group's current state:
+
+  ```
+  part of group rma: primary rma-admin-app :3100 (running); also rma-api :3101, rma-mariadb :3102
   ```
   Unknown non-project directory: print nothing.
 * `session-end`: clear `owner_session` where it equals `session_id`.
@@ -322,7 +412,10 @@ Claude Code. Keep SessionStart under 300 ms: direct DB access, `reconcile(quick=
    `{"type": "command", "command": "portboard hook <event>", "timeout": 10}`.
    Never duplicate an entry that already has the same command.
 6. `--discover`: run discover over PROJECTS_ROOT and register what has a clear
-   stack, without starting anything.
+   stack, without starting anything. `scan()` reports a group directory as one
+   `kind='group'` suggestion instead of descending into its children, so this
+   registers via `registry.add_group` (children included) rather than one
+   `add_project` per sibling repo.
 
 ## GUI (static/index.html)
 
@@ -337,6 +430,18 @@ Events (last 50). Open uses `target="_blank" rel="noopener"`. Light and dark
 via `prefers-color-scheme`. Register-project form (path, name, kind, start
 command, port). Settings drawer for evening/morning times, idle minutes,
 pool range. Copy link falls back to a prompt when clipboard API is missing.
+
+A `kind='group'` project renders as one card at the top-level grid, showing
+the mirrored primary child's port/state/url like any other project card
+(Start/Stop/Restart act on the whole group, in `group_start_order`). Inside
+that card, a **Services** block lists every child from `services` (name,
+port, state, its own Start/Stop/Logs) so the whole group is visible and
+controllable without leaving the card; a child that is listening but is not
+the primary gets an "also listening on http://localhost:<port>" notice next
+to the group's main url. Children are never rendered as their own top-level
+cards in the grid — `list_projects` still returns them (for `/api/projects`
+callers and the CLI), but the GUI filters out any project with `parent` set
+before laying out the grid, and renders it only inside its group's card.
 
 ## Discover (discover.py)
 
@@ -356,10 +461,54 @@ pool range. Copy link falls back to a prompt when clipboard API is missing.
   `<venv python> -m uvicorn <app.module:app> --port {port}` when an obvious
   `app/main.py` or `main.py` with `app = FastAPI()` exists, port_mode `arg`;
   `run.sh` at root -> start_cmd `./run.sh`, port_mode `env`.
+* `pom.xml` + `mvnw` at root (Spring Boot, no `run.sh`) -> `transient`,
+  start_cmd `./mvnw spring-boot:run`, port_mode `env` (Spring Boot reads
+  `SERVER_PORT`), confidence `medium`.
 * `Makefile` with `run`/`dev`/`up` target -> `transient`, `make <target>`, env.
+* repository with a manifest (`package.json`, `pyproject.toml`,
+  `requirements.txt`, `setup.py`/`.cfg`, `go.mod`, `Cargo.toml`,
+  `composer.json`, `Gemfile`, `mix.exs`, `Procfile`, `pom.xml`,
+  `build.gradle[.kts]`) but none of the above start commands -> kind `none`,
+  registered anyway (port allocated if there is evidence) so it shows up and
+  the user fills in a start command later.
 * else None.
 
+Port evidence, in addition to the framework-specific rules above: Spring's
+`server.port` (`server.port=N` or YAML `server:\n  port: N`) in
+`src/main/resources/application.properties`, `application.yml`, or
+`config/application.properties` -> confidence `medium`.
+
 `name` = directory basename lowercased, non `[a-z0-9-]` replaced by `-`.
+
+### Groups (`suggest_group`, `group_of`)
+
+`suggest_group(path) -> dict | None`: `path` must exist, not itself be a git
+repository, and not already `suggest()` as a project (a plain directory of
+sibling repos, not a repo of its own — e.g. `/mnt/hyper/Projects/rma` holding
+`admin-app`, `customer-app`, `server-side` as separate checkouts). Its
+immediate subdirectories that are git repositories (`has_git`) with a
+`suggest()` result become `children`, each renamed `<group>-<original name>`;
+fewer than `GROUP_MIN_CHILDREN` (2) such children -> None. Result: kind
+`group`, port_mode `none`, `children` (the renamed `suggest()` results),
+`primary` (`pick_primary(children)`'s name), confidence `medium`, evidence
+listing the sub-projects and the primary guess.
+
+`pick_primary(children) -> dict | None` / `primary_score(name, base_port,
+kind) -> int`: sum `PRIMARY_TOKENS` scores of the name's `[^a-z0-9]+`-split
+tokens (frontend/web/ui/admin/client/app/customer/portal/dashboard score
+positive, api/server/backend/service/worker/db/database/mariadb/mysql/
+postgres/redis/mail/mailpit/tools score negative or strongly negative),
+`-1` when `kind == 'none'` (can't be started by us), `+1` when the child has
+a `base_port`. Highest score wins; ties broken by lowest `base_port` (a
+child with no port sorts last), then by name.
+
+`group_of(path, projects_root=None) -> dict | None`: the group suggestion
+for the directory holding `path` (a repo, or the group directory itself).
+`None` when `path == projects_root`, when `path`'s parent is `projects_root`
+or `/` (a plain top-level repo is never treated as a lone-child group), or
+when the parent has fewer than 2 recognisable repos. Called with the group
+directory itself (no `.git`, not a project) it returns `suggest_group(path)`
+directly rather than looking at its parent.
 
 ## CLI (cli.py)
 
@@ -374,11 +523,20 @@ portboard logs [<project>[@label] | --id N] [-n 200]
 portboard reconcile [--quick] [--adopt]
 portboard adopt <port> [--project NAME]
 portboard project add PATH [--name N --kind K --start CMD --port P --port-mode M --pinned]
-portboard project edit NAME [same flags]
-portboard project rm NAME
+                                     [--parent GROUP]                 register as a child of GROUP
+                                     [--kind group]                   run discover.suggest_group(PATH)
+                                                                       + registry.add_group instead of
+                                                                       a plain add_project; --parent/
+                                                                       --start/--port/--port-mode refused
+portboard project edit NAME [same flags] [--primary CHILD]           group only: set/clear the
+                                                                       explicit primary_child (name or id)
+portboard project rm NAME                                            a group removes its children too
 portboard project pin|unpin NAME
-portboard project show NAME
-portboard discover [ROOT] [--apply]
+portboard project show NAME                                          a group also lists its children
+                                                                       and which one is primary
+portboard discover [ROOT] [--apply]                                  a group directory prints one
+                                                                       suggestion (kind group, its
+                                                                       children) instead of one per repo
 portboard schedule stop|start
 portboard tick
 portboard serve [--port N]
@@ -387,6 +545,10 @@ portboard hook <session-start|session-end|pre-tool-use|worktree-create|worktree-
 portboard install [--mcp] [--hooks] [--discover] [--all]
 portboard export > file.json / portboard import file.json
 ```
+
+`portboard list` renders a group as one line (its mirrored state/port) with
+its children indented underneath, rather than the group and every child as
+independent top-level rows.
 
 Exit code 0 on success, 1 on a handled error (message on stderr), `--json`
 prints machine-readable output on stdout.

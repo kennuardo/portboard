@@ -78,7 +78,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Status of the project that owns a directory: the project, all of its instances "
             "(main checkout and worktrees), the instance for this exact directory, its assigned "
-            "port and URL. Tells you whether the directory is registered at all."
+            "port and URL. Tells you whether the directory is registered at all. When the project "
+            "belongs to a group (a directory of sibling sub-repos started together), \"group\" "
+            "carries the group name, its primary (frontend) child and every service with its port."
         ),
         "inputSchema": _schema(
             {"cwd": {"type": "string", "description": _CWD_DOC}},
@@ -92,7 +94,8 @@ TOOLS: list[dict[str, Any]] = [
             "an instance row exists for this checkout (main checkout or Claude Code worktree), "
             "assign it a port and optionally mark the session as its owner. Returns the project, "
             "the instance, its port and URL. Call this once at the start of a session before "
-            "starting a dev server."
+            "starting a dev server. A directory of sibling sub-repos is registered as a group and "
+            "the answer then also carries \"group\" with every service and its port."
         ),
         "inputSchema": _schema(
             {
@@ -147,20 +150,35 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Register a repository as a Portboard project. Missing fields are guessed from the "
             "repository contents (package.json, compose file, pyproject, Makefile). path must be "
-            "an absolute path to the main checkout."
+            "an absolute path to the main checkout. Pass kind=group for a directory that is not a "
+            "repository itself but holds several sibling sub-repos (admin-app, server-side, ...): "
+            "the group and every sub-project are registered together and started as one unit. "
+            "Without an explicit kind a directory that looks like such a group is registered as one."
         ),
         "inputSchema": _schema(
             {
-                "path": {"type": "string", "description": "Absolute path of the repository's main checkout."},
+                "path": {"type": "string",
+                         "description": "Absolute path of the repository's main checkout, or of the "
+                                        "directory holding the sub-repos when kind=group."},
                 "name": {"type": "string", "description": "Project name; defaults to the directory basename."},
                 "kind": {"type": "string", "enum": list(config.KINDS),
-                         "description": "transient (systemd-run of start_cmd), unit, compose or none."},
+                         "description": "transient (systemd-run of start_cmd), unit, compose, container "
+                                        "(an existing docker container named in start_cmd), group (a "
+                                        "directory of sibling sub-repos started together) or none."},
                 "start_cmd": {"type": "string",
-                              "description": "Shell command for transient projects, unit name for kind=unit."},
+                              "description": "Shell command for transient projects, unit name for kind=unit, "
+                                             "container name for kind=container; unused for kind=group."},
                 "base_port": {"type": "integer", "minimum": 1, "maximum": 32767,
-                              "description": "Port of the main checkout; worktree slot n uses base_port+n."},
+                              "description": "Port of the main checkout; worktree slot n uses base_port+n. "
+                                             "A group has no port of its own - it shows its primary child's."},
                 "port_mode": {"type": "string", "enum": list(config.PORT_MODES),
                               "description": "env (PORT is injected), arg ({port} in start_cmd), fixed or none."},
+                "primary": {"type": "string",
+                            "description": "kind=group only: name of the sub-project whose port and URL the "
+                                           "group shows (the frontend) and which is started last."},
+                "parent": {"type": "string",
+                           "description": "Name of an already registered group this project becomes a "
+                                          "sub-project of."},
             },
             ["path"],
         ),
@@ -206,7 +224,58 @@ def _compact(inst: dict, project: dict | None = None) -> dict[str, Any]:
         "url": _url(inst, project),
         "owner_session": inst.get("owner_session"),
         "worktree": bool(worktree),
+        "parent": inst.get("parent") or (project or {}).get("parent"),
     }
+
+
+def _group_main(conn, group: dict) -> dict:
+    """The group's main instance view (slot 0 / label 'main'), or {}."""
+    try:
+        instances = _lazy("registry").list_instances(conn, project_id=group["id"]) or []
+    except Exception:
+        log.exception("group %s: listing instances failed", group.get("name"))
+        return {}
+    for inst in instances:
+        if inst.get("label") == "main" or not inst.get("slot"):
+            return inst
+    return {}
+
+
+def _group_view(conn, group: dict | None) -> dict | None:
+    """Compact view of a group: its primary child plus every service's port.
+
+    Built from the group's main instance, which mirrors the primary child's
+    main instance and carries ``services`` (the children's main instances).
+    """
+    if not group:
+        return None
+    main = _group_main(conn, group)
+    services = [
+        {
+            "name": svc.get("project"),
+            "port": svc.get("port"),
+            "actual_port": svc.get("actual_port"),
+            "state": svc.get("state"),
+            "url": _url(svc),
+        }
+        for svc in (main.get("services") or [])
+    ]
+    return {
+        "name": group.get("name"),
+        "path": group.get("path"),
+        "primary": main.get("primary") or group.get("primary"),
+        "primary_port": main.get("port") or main.get("actual_port"),
+        "url": _url(main) if main else None,
+        "services": services,
+    }
+
+
+def _group_of(conn, res, project: dict | None) -> dict | None:
+    """The group a resolved project belongs to - or the project itself."""
+    group = getattr(res, "group", None) if res else None
+    if group is None and (project or {}).get("kind") == "group":
+        group = project
+    return group
 
 
 def _abs(path: Any, field: str = "cwd") -> str:
@@ -249,6 +318,7 @@ class _Res:
         self.is_worktree = bool(label and label != "main")
         self.slug = label
         self.path = None
+        self.group = None
 
 
 def _project_of(conn, inst: dict) -> dict | None:
@@ -305,15 +375,23 @@ def _tool_project_status(conn, args: dict) -> dict:
     instances = registry.list_instances(conn, project_id=project["id"])
     this = getattr(res, "instance", None)
     compact_this = _compact(this, project) if this else None
+    group = _group_view(conn, _group_of(conn, res, project))
+    assigned_port = (this or {}).get("port") if this else project.get("base_port")
+    url = _url(this, project) if this else None
+    if group and project.get("kind") == "group":
+        # a group has no port of its own: show the primary child's
+        assigned_port = assigned_port or group.get("primary_port")
+        url = url or group.get("url")
     return {
         "registered": True,
         "cwd": cwd,
         "project": project,
         "instances": [_compact(i, project) for i in instances],
         "this": compact_this,
-        "assigned_port": (this or {}).get("port") if this else project.get("base_port"),
-        "url": _url(this, project) if this else None,
+        "assigned_port": assigned_port,
+        "url": url,
         "running": [_compact(i, project) for i in instances if i.get("state") == "running"],
+        "group": group,
     }
 
 
@@ -325,18 +403,31 @@ def _tool_project_claim(conn, args: dict) -> dict:
     project = getattr(res, "project", None) if res else None
     if not project:
         discover = _lazy("discover")
+        # cwd may be a sub-repo of a group, or the group directory itself (which
+        # is not a repo at all - _git_root returns None there and root is cwd).
         root = _git_root(cwd) or cwd
-        if not discover.looks_like_project(root):
-            raise ValueError(
-                f"{cwd} is not a recognizable project (no git repo with a known stack at {root}); "
-                "register it explicitly with project_register if it is one"
-            )
-        suggestion = dict(discover.suggest(root) or {})
-        suggestion.pop("confidence", None)
-        suggestion.pop("evidence", None)
-        path = suggestion.pop("path", root)
-        project = registry.add_project(conn, path, source="mcp", allow_busy=True, **suggestion)
-        res = _resolved(conn, cwd)
+        group_suggestion = None
+        try:
+            group_suggestion = discover.group_of(root)
+        except Exception as exc:
+            log.info("discover.group_of(%s) failed: %s", root, exc)
+        if group_suggestion:
+            registry.add_group(conn, group_suggestion, source="mcp", allow_busy=True)
+            res = _resolved(conn, cwd)
+            project = getattr(res, "project", None) if res else None
+        if not project:
+            if not discover.looks_like_project(root):
+                raise ValueError(
+                    f"{cwd} is not a recognizable project (no git repo with a known stack at {root}); "
+                    "register it explicitly with project_register if it is one"
+                )
+            suggestion = dict(discover.suggest(root) or {})
+            suggestion.pop("confidence", None)
+            suggestion.pop("evidence", None)
+            path = suggestion.pop("path", root)
+            project = registry.add_project(conn, path, source="mcp", allow_busy=True, **suggestion)
+            res = _resolved(conn, cwd)
+            project = (getattr(res, "project", None) if res else None) or project
 
     inst = getattr(res, "instance", None) if res else None
     if not inst:
@@ -345,12 +436,19 @@ def _tool_project_claim(conn, args: dict) -> dict:
     if session_id:
         registry.set_owner(conn, inst["id"], session_id)
         inst = registry.get_instance(conn, inst["id"]) or inst
+    group = _group_view(conn, _group_of(conn, res, project))
+    if project.get("kind") == "group":
+        group_path = project.get("path") or cwd
+        start_hint = f"instance_start(cwd={group_path!r})  # starts every service, frontend last"
+    else:
+        start_hint = f"instance_start(cwd={cwd!r})"
     return {
         "project": project,
         "instance": _compact(inst, project),
         "port": inst.get("port"),
         "url": _url(inst, project),
-        "start_hint": f"instance_start(cwd={cwd!r})",
+        "start_hint": start_hint,
+        "group": group,
     }
 
 
@@ -423,15 +521,67 @@ def _tool_reconcile(conn, args: dict) -> dict:
     return _lazy("reconcile").reconcile(conn, quick=bool(args.get("quick", False)))
 
 
+def _fresh_project(conn, project: dict) -> dict:
+    registry = _lazy("registry")
+    try:  # match an already-running dev server to the new instance right away
+        _lazy("reconcile").reconcile(conn, quick=True)
+    except Exception:
+        log.exception("project_register: quick reconcile failed")
+        return project
+    fresh = registry.get_project(conn, project["id"])
+    return fresh if isinstance(fresh, dict) else project
+
+
+def _register_group(conn, path: str, args: dict, suggestion: dict | None) -> dict:
+    registry = _lazy("registry")
+    if not suggestion:
+        raise ValueError(
+            f"no sub-projects found under {path}: a group needs a directory that is not a git "
+            "repository itself and holds at least two sibling repositories with a known stack"
+        )
+    suggestion = dict(suggestion)
+    if args.get("name"):
+        suggestion["name"] = args["name"]
+    group = registry.add_group(conn, suggestion, source="mcp", allow_busy=True)
+    primary = args.get("primary")
+    if primary:
+        registry.update_project(conn, group["id"], primary_child=primary)
+    return _fresh_project(conn, group)
+
+
+def _parent_id_for(conn, parent: Any) -> int | None:
+    if parent is None:
+        return None
+    project = _lazy("registry").get_project(conn, parent)
+    if project is None:
+        raise ValueError(f"no project named {parent!r} to use as a group; register it first with kind='group'")
+    if project.get("kind") != "group":
+        raise ValueError(f"project {parent!r} is not a group (kind {project.get('kind')!r})")
+    return project["id"]
+
+
 def _tool_project_register(conn, args: dict) -> dict:
     registry = _lazy("registry")
+    discover = _lazy("discover")
     path = _abs(args.get("path"), "path")
+    kind = args.get("kind")
     fields: dict[str, Any] = {}
     try:
-        suggestion = _lazy("discover").suggest(path) or {}
+        suggestion = discover.suggest(path) or {}
     except Exception as exc:
         log.info("discover.suggest(%s) failed: %s", path, exc)
         suggestion = {}
+
+    group_suggestion = None
+    if kind == "group" or (kind is None and not suggestion):
+        try:
+            group_suggestion = discover.suggest_group(path)
+        except Exception as exc:
+            log.info("discover.suggest_group(%s) failed: %s", path, exc)
+    if kind == "group" or (kind is None and not suggestion and group_suggestion):
+        return _register_group(conn, path, args, group_suggestion)
+
+    parent_id = _parent_id_for(conn, args.get("parent"))
     for key, value in suggestion.items():
         if key in ("confidence", "evidence", "path"):
             continue
@@ -442,14 +592,10 @@ def _tool_project_register(conn, args: dict) -> dict:
     # A port discovered in the repo may already be held by the project's own
     # dev server; only an explicit caller-supplied port is checked strictly.
     allow_busy = args.get("base_port") is None
+    if parent_id is not None:
+        fields["parent_id"] = parent_id
     project = registry.add_project(conn, path, source="mcp", allow_busy=allow_busy, **fields)
-    try:  # match an already-running dev server to the new instance right away
-        _lazy("reconcile").reconcile(conn, quick=True)
-    except Exception:
-        log.exception("project_register: quick reconcile failed")
-        return project
-    fresh = registry.get_project(conn, project["id"])
-    return fresh if isinstance(fresh, dict) else project
+    return _fresh_project(conn, project)
 
 
 TOOL_IMPLS = {

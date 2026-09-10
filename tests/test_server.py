@@ -36,6 +36,25 @@ class RunnerError(Exception):
     pass
 
 
+# A registered group plus the discover.suggest_group() result it came from.
+GROUP = {
+    "id": 10, "name": "rma", "path": "/repo/rma", "kind": "group", "port_mode": "none",
+    "base_port": None, "parent": None, "children": [11, 12],
+    "child_names": ["rma-admin-app", "rma-server-side"],
+    "primary_child_id": 11, "primary": "rma-admin-app",
+}
+
+GROUP_SUGGESTION = {
+    "path": "/repo/rma", "name": "rma", "kind": "group", "port_mode": "none",
+    "start_cmd": None, "base_port": None,
+    "children": [
+        {"path": "/repo/rma/admin-app", "name": "rma-admin-app", "kind": "transient"},
+        {"path": "/repo/rma/server-side", "name": "rma-server-side", "kind": "transient"},
+    ],
+    "primary": "rma-admin-app", "confidence": 0.9, "evidence": ["2 git sub-projects"],
+}
+
+
 def make_fake_modules() -> dict[str, types.ModuleType]:
     """Stand-ins for the modules server.py calls, all mocks except the errors."""
     registry = types.ModuleType("portboard.registry")
@@ -46,6 +65,8 @@ def make_fake_modules() -> dict[str, types.ModuleType]:
     registry.get_project = mock.MagicMock(return_value=None)
     registry.reorder_projects = mock.MagicMock(return_value=[])
     registry.add_project = mock.MagicMock(return_value={"id": 1, "name": "demo"})
+    registry.add_group = mock.MagicMock(return_value=dict(GROUP))
+    registry.group_children = mock.MagicMock(return_value=[])
     registry.update_project = mock.MagicMock(return_value={"id": 1, "name": "demo"})
     registry.delete_project = mock.MagicMock(return_value=None)
     registry.list_instances = mock.MagicMock(return_value=[])
@@ -67,6 +88,7 @@ def make_fake_modules() -> dict[str, types.ModuleType]:
 
     discover = types.ModuleType("portboard.discover")
     discover.suggest = mock.MagicMock(return_value={"name": "demo", "kind": "transient"})
+    discover.suggest_group = mock.MagicMock(return_value=dict(GROUP_SUGGESTION))
     discover.looks_like_project = mock.MagicMock(return_value=True)
 
     schedule = types.ModuleType("portboard.schedule")
@@ -446,6 +468,188 @@ class ApiActionsTest(ServerTestCase):
         status, _, payload = self.json_req("POST", "/api/settings", {"totally_made_up": "1"})
         self.assertEqual(status, 400)
         self.assertIn("totally_made_up", payload["error"])
+
+
+class GroupApiTest(ServerTestCase):
+    """Group projects: registration, parent/primary_child patches, cascading delete."""
+
+    def test_add_group_consults_suggest_group_and_registers_it(self):
+        status, _, payload = self.json_req("POST", "/api/projects",
+                                           {"path": "/repo/rma", "kind": "group"})
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["name"], "rma")
+        self.assertEqual(payload["kind"], "group")
+        self.assertEqual(payload["primary"], "rma-admin-app")
+        self.discover.suggest_group.assert_called_once_with("/repo/rma")
+        args, kwargs = self.registry.add_group.call_args
+        suggestion = args[1]
+        self.assertEqual(suggestion["path"], "/repo/rma")
+        self.assertEqual(suggestion["kind"], "group")
+        self.assertEqual(suggestion["primary"], "rma-admin-app")
+        self.assertEqual([c["name"] for c in suggestion["children"]],
+                         ["rma-admin-app", "rma-server-side"])
+        self.assertEqual(kwargs["source"], "gui")
+        self.registry.add_project.assert_not_called()
+        self.assertTrue(self.reconcile.reconcile.call_args.kwargs["quick"])
+
+    def test_add_group_merges_explicit_body_fields_over_the_suggestion(self):
+        status, _, _ = self.json_req("POST", "/api/projects", {
+            "path": "/repo/rma", "kind": "group", "name": "RMA",
+            "notes": "three apps", "source": "cli",
+        })
+        self.assertEqual(status, 201)
+        args, kwargs = self.registry.add_group.call_args
+        self.assertEqual(args[1]["name"], "RMA")
+        self.assertEqual(args[1]["notes"], "three apps")
+        self.assertEqual(args[1]["kind"], "group")
+        self.assertEqual(kwargs["source"], "cli")
+
+    def test_add_group_without_sub_projects_is_400(self):
+        self.discover.suggest_group.return_value = None
+        status, _, payload = self.json_req("POST", "/api/projects",
+                                           {"path": "/repo/lonely", "kind": "group"})
+        self.assertEqual(status, 400)
+        self.assertIn("/repo/lonely", payload["error"])
+        self.assertIn("sibling", payload["error"])
+        self.registry.add_group.assert_not_called()
+
+    def test_add_child_resolves_parent_name_to_parent_id(self):
+        self.registry.get_project.side_effect = \
+            lambda conn, ref: dict(GROUP) if ref in ("rma", 10) else None
+        self.registry.add_project.return_value = {"id": 11, "name": "rma-admin-app"}
+        status, _, payload = self.json_req("POST", "/api/projects",
+                                           {"path": "/repo/rma/admin-app", "parent": "rma"})
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["name"], "rma-admin-app")
+        args, kwargs = self.registry.add_project.call_args
+        self.assertEqual(args[1], "/repo/rma/admin-app")
+        self.assertEqual(kwargs["parent_id"], 10)
+        self.assertNotIn("parent", kwargs)
+
+    def test_add_child_passes_a_numeric_parent_id_through(self):
+        self.registry.add_project.return_value = {"id": 11, "name": "rma-admin-app"}
+        status, _, _ = self.json_req("POST", "/api/projects",
+                                     {"path": "/repo/rma/admin-app", "parent_id": 10})
+        self.assertEqual(status, 201)
+        _, kwargs = self.registry.add_project.call_args
+        self.assertEqual(kwargs["parent_id"], 10)
+
+    def test_add_child_with_unknown_parent_is_400(self):
+        self.registry.get_project.return_value = None
+        status, _, payload = self.json_req("POST", "/api/projects",
+                                           {"path": "/repo/x", "parent": "nope"})
+        self.assertEqual(status, 400)
+        self.assertIn("nope", payload["error"])
+        self.registry.add_project.assert_not_called()
+
+    def test_add_child_whose_parent_is_not_a_group_is_400(self):
+        self.registry.get_project.return_value = {"id": 3, "name": "demo", "kind": "transient"}
+        status, _, payload = self.json_req("POST", "/api/projects",
+                                           {"path": "/repo/x", "parent": "demo"})
+        self.assertEqual(status, 400)
+        self.assertIn("not a group", payload["error"])
+        self.registry.add_project.assert_not_called()
+
+    def test_patch_forwards_primary_child_by_name(self):
+        self.registry.update_project.return_value = {"id": 10, "primary": "rma-admin-app"}
+        status, _, payload = self.json_req("PATCH", "/api/projects/10",
+                                           {"primary_child": "rma-admin-app"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["primary"], "rma-admin-app")
+        args, kwargs = self.registry.update_project.call_args
+        self.assertEqual(args[1], 10)
+        self.assertEqual(kwargs["primary_child"], "rma-admin-app")
+
+    def test_patch_passes_allow_busy_as_a_keyword_not_a_field(self):
+        seen = {}
+
+        def fake_update(conn, project_id, allow_busy=False, **fields):
+            seen.update(project_id=project_id, allow_busy=allow_busy, fields=fields)
+            return {"id": project_id, "base_port": fields.get("base_port")}
+
+        self.registry.update_project = mock.MagicMock(side_effect=fake_update)
+        status, _, payload = self.json_req("PATCH", "/api/projects/3",
+                                           {"allow_busy": True, "base_port": 3100})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["base_port"], 3100)
+        self.assertEqual(seen["project_id"], 3)
+        self.assertTrue(seen["allow_busy"])
+        self.assertEqual(seen["fields"], {"base_port": 3100})
+
+    def test_patch_translates_parent_name_and_clears_it(self):
+        self.registry.get_project.side_effect = \
+            lambda conn, ref: dict(GROUP) if ref in ("rma", 10) else {"id": 11, "name": "child"}
+        self.registry.update_project.return_value = {"id": 11, "name": "rma-admin-app"}
+        status, _, _ = self.json_req("PATCH", "/api/projects/11", {"parent": "rma"})
+        self.assertEqual(status, 200)
+        _, kwargs = self.registry.update_project.call_args
+        self.assertEqual(kwargs["parent_id"], 10)
+        self.assertNotIn("parent", kwargs)
+
+        status, _, _ = self.json_req("PATCH", "/api/projects/11", {"parent": None})
+        self.assertEqual(status, 200)
+        _, kwargs = self.registry.update_project.call_args
+        self.assertIn("parent_id", kwargs)
+        self.assertIsNone(kwargs["parent_id"])
+
+    def test_delete_group_stops_child_instances_before_deleting(self):
+        self.registry.get_project.return_value = dict(GROUP)
+        self.registry.group_children.return_value = [
+            {"id": 11, "name": "rma-admin-app"}, {"id": 12, "name": "rma-server-side"},
+        ]
+        instances = {
+            10: [],
+            11: [{"id": 21, "state": "running", "managed": 1}],
+            12: [{"id": 22, "state": "starting", "managed": 1},
+                 {"id": 23, "state": "stopped", "managed": 1},
+                 {"id": 24, "state": "running", "managed": 0}],
+        }
+        self.registry.list_instances.side_effect = \
+            lambda conn, project_id=None: list(instances.get(project_id, []))
+        order: list = []
+        self.runner.stop.side_effect = \
+            lambda conn, iid, reason=None: (order.append(iid), {"id": iid})[1]
+        self.registry.delete_project.side_effect = \
+            lambda conn, pid: order.append(("delete", pid))
+
+        status, _, payload = self.json_req("DELETE", "/api/projects/10")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(order, [21, 22, ("delete", 10)])
+        self.registry.group_children.assert_called_once()
+
+    def test_delete_group_survives_a_failing_child_stop(self):
+        self.registry.get_project.return_value = dict(GROUP)
+        self.registry.group_children.return_value = [{"id": 11, "name": "rma-admin-app"}]
+        self.registry.list_instances.side_effect = lambda conn, project_id=None: (
+            [{"id": 21, "state": "running", "managed": 1}] if project_id == 11 else []
+        )
+        self.runner.stop.side_effect = RunnerError("unit is gone")
+        status, _, payload = self.json_req("DELETE", "/api/projects/10")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.registry.delete_project.assert_called_once()
+
+    def test_delete_child_project_does_not_touch_group_bookkeeping(self):
+        self.registry.get_project.return_value = {
+            "id": 11, "name": "rma-admin-app", "path": "/repo/rma/admin-app",
+            "kind": "transient", "parent": "rma",
+        }
+        self.registry.list_instances.return_value = [{"id": 21, "state": "running", "managed": 1}]
+        status, _, payload = self.json_req("DELETE", "/api/projects/11")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.registry.group_children.assert_not_called()
+        self.runner.stop.assert_called_once()
+        self.registry.delete_project.assert_called_once()
+
+    def test_delete_group_works_when_registry_has_no_group_children(self):
+        del self.registry.group_children
+        self.registry.get_project.return_value = dict(GROUP)
+        status, _, payload = self.json_req("DELETE", "/api/projects/10")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.registry.delete_project.assert_called_once()
 
 
 class DbBackedTest(ServerTestCase):

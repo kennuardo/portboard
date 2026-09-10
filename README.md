@@ -92,6 +92,36 @@ portboard export > file.json / portboard import file.json
 to machine-readable output. Exit code 0 on success, 1 on a handled error
 (message on stderr), 2 on a bad command line.
 
+## Multi-repo projects (groups)
+
+Some projects aren't one repository — `/mnt/hyper/Projects/rma` is a
+directory holding three sibling checkouts (`admin-app`, `customer-app`,
+`server-side`) that only make sense running together. Portboard models that
+as a `kind='group'` project at the directory, with each sibling registered
+as an ordinary child project (`parent_id` pointing at the group).
+
+- One GUI card, `rma`, shows the port and status of the child a human would
+  actually open (the "primary" — picked automatically by name, or set
+  explicitly), plus a **Services** list of every child underneath it.
+- **Start** on the group card starts every child in display order with the
+  primary last, so `rma-mariadb` and `rma-server-side` are already listening
+  before `rma-admin-app` (the frontend) comes up.
+- `portboard discover` recognises the directory as a group on its own
+  (>= 2 sibling git repos, no `.git` at the directory itself) and registers
+  it and its children in one call.
+
+```
+portboard project add /mnt/hyper/Projects/rma --kind group
+portboard project edit rma --primary rma-admin-app
+portboard project add /mnt/hyper/Projects/rma/podklady --name rma-mariadb \
+    --parent rma --kind container --start rma-mariadb --port 3306 --port-mode fixed
+```
+
+The last line is the other new kind, `container`: a docker container that
+already exists (started by hand, or by someone else's `docker compose`) and
+that Portboard should only `docker start`/`stop`/watch rather than manage
+the full lifecycle of — `--start` names the container, not a shell command.
+
 ## How Claude Code uses it
 
 **Hooks** (via `portboard install --hooks`):
